@@ -145,9 +145,9 @@ class Game:
                 pygame.event.post(pygame.event.Event(pygame.QUIT))
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mx, my = event.pos
-            play_rect  = pygame.Rect(SCREEN_WIDTH//2 - 130, 320, 260, 52)
-            lb_rect    = pygame.Rect(SCREEN_WIDTH//2 - 130, 390, 260, 52)
-            quit_rect  = pygame.Rect(SCREEN_WIDTH//2 - 130, 460, 260, 52)
+            play_rect  = pygame.Rect(SCREEN_WIDTH//2 - 130, 272, 260, 54)
+            lb_rect    = pygame.Rect(SCREEN_WIDTH//2 - 130, 342, 260, 54)
+            quit_rect  = pygame.Rect(SCREEN_WIDTH//2 - 130, 412, 260, 54)
             if play_rect.collidepoint(mx, my):
                 self._name_input = ""
                 self.change_state(STATE_NAME_ENTRY)
