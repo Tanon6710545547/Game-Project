@@ -141,6 +141,33 @@ The following features were added beyond the original proposal:
 
 ## 7. External Sources
 
+**Reference Games (concept and code inspiration):**
+
+1. **The Infinite Tower** — https://www.pygame.org/project/4283
+   - *What was taken / adapted:* The core roguelike loop concept — a player fights enemies on each floor, collects gold, and tries to ascend as high as possible before dying. The floor-progression gate (kill all enemies → exit opens) was directly inspired by this game.
+   - *What was changed:* Kiritoo adds procedural tile generation, a floor curse system, a combo multiplier, a merchant shop, animated sprites, a multi-phase boss, and a full data-tracking pipeline — none of which exist in The Infinite Tower.
+
+2. **pgRPG - ECS Pygame Game Engine** — https://www.pygame.org/project/5674/8284
+   - *What was taken / adapted:* Used as a structural reference for pygame game loop organisation, tile-based map rendering, and basic 2D player movement and collision handling.
+   - *What was changed:* The ECS (Entity-Component-System) architecture was not adopted. All classes were written from scratch as plain OOP (Player, Enemy, Floor, etc.). BFS pathfinding, the state machine, and all game-specific logic are original work.
+
+**What was added originally in Kiritoo (not from either source):**
+- BFS pathfinding for enemy AI navigation around walls
+- 8-type floor curse system applied randomly each floor
+- Kill-combo multiplier with 2-second expiry window
+- Multi-phase boss at floor 20 with special attacks and summoning
+- Merchant shop every 5 floors with item rarity tiers (common / rare / epic)
+- Animated sprite system (`SpriteAnim`, `sprite_loader.py`) with idle/walk/attack/hurt states
+- In-game stats overlay (TAB) with live bar charts and scrollable leaderboard
+- Full data pipeline: `StatTracker` → `data/stats.csv` → matplotlib visualization
+- Persistent cross-session leaderboard saved to `data/leaderboard.csv`
+- Procedural tile map generation (randomised layout each run)
+- Stamina system for skill usage (V / B / E skills)
+- Sound manager (`sounds.py`)
+- Boss cutscene state and named-player entry screen
+
+---
+
 **Libraries:**
 
 1. **Pygame** — game framework used for rendering, input, and sound.

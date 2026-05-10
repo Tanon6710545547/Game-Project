@@ -121,7 +121,14 @@ python3 stats_analysis.py
 
 Acknowledge to:
 
-1. **Pygame** — game framework. https://www.pygame.org [LGPL License]
+**Reference games:**
+
+1. **The Infinite Tower** — floor-climbing roguelike concept and floor-gate mechanic. https://www.pygame.org/project/4283
+2. **pgRPG - ECS Pygame Game Engine** — pygame game loop and tile-map structure reference. https://www.pygame.org/project/5674/8284
+
+**Libraries:**
+
+3. **Pygame** — game framework. https://www.pygame.org [LGPL License]
 2. **Matplotlib** — graphs and UML diagram. https://matplotlib.org [PSF/BSD License]
 3. **NumPy** — vector math in UML generation. https://numpy.org [BSD License]
 4. **Character sprites** — Tiny RPG Character Asset Pack v1.03 by zerie. https://zerie.itch.io/tiny-rpg-character-asset-pack
