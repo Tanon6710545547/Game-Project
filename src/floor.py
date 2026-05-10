@@ -12,7 +12,7 @@ from src.constants import (
     CURSES, CURSE_WEIGHTS,
     SCREEN_WIDTH, SCREEN_HEIGHT,
     FLOOR_COLOR, WALL_COLOR, DARK_BG,
-    MERCHANT_FLOOR_INTERVAL,
+    MERCHANT_FLOOR_INTERVAL, ASSETS_DIR,
 )
 from src.enemy import Enemy, Boss
 from src.item import Item, random_item_by_rarity
@@ -22,7 +22,6 @@ _ITEM_IMAGES: dict = {}
 def _load_item_images():
     if _ITEM_IMAGES:
         return
-    _src = os.path.dirname(__file__)
     for item_type, filename in [
         ("potion", "heal.png"),
         ("weapon", "sword.png"),
@@ -30,7 +29,7 @@ def _load_item_images():
         ("gold",   "gold-coins-.png"),
         ("buff",   "gacha.png"),
     ]:
-        path = os.path.join(_src, filename)
+        path = os.path.join(ASSETS_DIR, filename)
         try:
             img = pygame.image.load(path).convert_alpha()
             _ITEM_IMAGES[item_type] = pygame.transform.smoothscale(img, (18, 18))

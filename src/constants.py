@@ -1,6 +1,7 @@
 """
 constants.py - Game-wide constants and configuration
 """
+import os
 
 # Screen
 SCREEN_WIDTH  = 960
@@ -31,13 +32,14 @@ FLOOR_COLOR = (55,  50,  70)
 WALL_COLOR  = (25,  22,  38)
 
 # Game States
-STATE_MENU        = "menu"
-STATE_NAME_ENTRY  = "name_entry"
-STATE_PLAYING     = "playing"
-STATE_MERCHANT    = "merchant"
-STATE_GAME_OVER   = "game_over"
-STATE_LEADERBOARD = "leaderboard"
-STATE_PAUSED      = "paused"
+STATE_MENU           = "menu"
+STATE_NAME_ENTRY     = "name_entry"
+STATE_PLAYING        = "playing"
+STATE_MERCHANT       = "merchant"
+STATE_GAME_OVER      = "game_over"
+STATE_LEADERBOARD    = "leaderboard"
+STATE_PAUSED         = "paused"
+STATE_BOSS_CUTSCENE  = "boss_cutscene"
 
 # Player
 PLAYER_START_HP     = 100
@@ -54,7 +56,7 @@ ENEMY_EXP_BASE   = 20
 ENEMY_AGGRO_RADIUS = 250  # pixels
 
 # Boss  (tougher: bigger HP/ATK pool)
-BOSS_HP_MULT  = 12
+BOSS_HP_MULT  = 35
 BOSS_ATK_MULT = 3.5
 
 # Items
@@ -99,7 +101,9 @@ HP_SAMPLE_INTERVAL_MS = 2000
 # Leaderboard
 LEADERBOARD_SIZE = 10
 
-# CSV paths
-DATA_DIR            = "data"
-STATS_CSV           = "data/stats.csv"
-LEADERBOARD_CSV     = "data/leaderboard.csv"
+# Paths
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ASSETS_DIR    = os.path.join(_PROJECT_ROOT, "assets")
+DATA_DIR      = os.path.join(_PROJECT_ROOT, "data")
+STATS_CSV     = os.path.join(DATA_DIR, "stats.csv")
+LEADERBOARD_CSV = os.path.join(DATA_DIR, "leaderboard.csv")

@@ -1,0 +1,33 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables
+.env
+.env.*
+
+# IDE / Editor settings
+.vscode/
+.idea/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+
+# macOS system files
+.DS_Store
+
+# Generated output (regenerate with generate_uml.py / stats_analysis.py)
+# uml.png is kept in the repo as documentation
+# data CSVs are kept as sample data
+
+# Large binary files that shouldn't be tracked
+*.pyc

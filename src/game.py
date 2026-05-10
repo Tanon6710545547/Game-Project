@@ -9,10 +9,11 @@ import time
 from src.constants import (
     SCREEN_WIDTH, SCREEN_HEIGHT, FPS, TITLE,
     STATE_MENU, STATE_NAME_ENTRY, STATE_PLAYING, STATE_MERCHANT,
-    STATE_GAME_OVER, STATE_LEADERBOARD, STATE_PAUSED,
+    STATE_GAME_OVER, STATE_LEADERBOARD, STATE_PAUSED, STATE_BOSS_CUTSCENE,
     HP_SAMPLE_INTERVAL_MS,
     DARK_BG, WHITE, YELLOW, GOLD_COLOR, RED, GREEN, GRAY
 )
+import numpy as np
 from src.player        import Player
 from src.floor         import Floor
 from src.merchant      import Merchant
@@ -20,6 +21,11 @@ from src.combo_system  import ComboSystem
 from src.stat_tracker  import StatTracker
 from src.leaderboard   import Leaderboard
 from src.hud           import HUD
+try:
+    from src.sounds import play_boss_death, play_boss_summon
+except Exception:
+    def play_boss_death(): pass
+    def play_boss_summon(): pass
 
 
 class Game:
@@ -38,9 +44,13 @@ class Game:
 
         self.font_title  = pygame.font.SysFont("monospace", 52, bold=True)
         self.font_xl     = pygame.font.SysFont("monospace", 70, bold=True)
+        self.font_card   = pygame.font.SysFont("monospace", 32, bold=True)
         self.font_big    = pygame.font.SysFont("monospace", 26, bold=True)
         self.font_med    = pygame.font.SysFont("monospace", 18)
         self.font_sm     = pygame.font.SysFont("monospace", 14)
+        # Thai-capable font for "ตา" unit label
+        self.font_th     = pygame.font.SysFont(
+            "thonburi,tahoma,arial unicode ms,arial,helvetica", 13)
 
         # Menu particle system
         self._menu_stars = [
@@ -84,6 +94,11 @@ class Game:
         self._merchant: Merchant | None = None
         self._feedback_msg: str = ""
         self._feedback_expire   = 0
+        self._show_stats_overlay  = False
+        self._stats_tab           = 0     # 0 = SESSION, 1 = ALL SESSIONS
+        self._selected_hist_idx: int | None = None  # row selected in ALL SESSIONS tab
+        self._table_scroll        = 0     # scroll offset for ALL SESSIONS table
+        self._last_session_stats: dict = {}  # cached before log is cleared on session end
 
     # ------------------------------------------------------------------
     def _reset_game(self):
@@ -99,12 +114,24 @@ class Game:
         self._won              = False
         self._pickup_anims     = []
         self._death_particles  = []
+        self._shake_end        = 0
+        self._shake_amp        = 0
+        self._boss_flash_end   = 0
+        self._color_drain_end  = 0   # screen desaturates during this window
+        self._slowmo_end       = 0   # time-scale reduced during this window
+        self._show_stats       = False
+        self._play_time_ms     = 0   # ms spent in STATE_PLAYING only
 
     # ------------------------------------------------------------------
     def run(self):
         running = True
         while running:
             dt = self.clock.tick(FPS)
+            # Apply slow-motion scale after boss death
+            _now_r = pygame.time.get_ticks()
+            if _now_r < getattr(self, "_slowmo_end", 0):
+                frac = max(0.15, (_now_r - (_now_r - (self._slowmo_end - _now_r))) / 1800)
+                dt   = int(dt * 0.18)
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -118,6 +145,60 @@ class Game:
     # EVENT HANDLING
     # ------------------------------------------------------------------
     def _handle_event(self, event: pygame.event.Event):
+        # Stats overlay intercepts all input while open
+        if self._show_stats_overlay:
+            # ── Panel geometry (mirrors _draw_stats_overlay) ──────────
+            _ow, _oh = 940, 640
+            _ox  = (SCREEN_WIDTH  - _ow) // 2   # 10
+            _oy  = (SCREEN_HEIGHT - _oh) // 2   # 40
+            _lx  = _ox + 14
+            _lw  = 548
+            _row_h   = 18
+            _cy_l    = _oy + 198
+            _tr_y0   = _cy_l + 26 + 16          # top of first data row
+            _tph     = _oy + _oh - 18 - _cy_l
+            _max_rows = max(0, (_tph - 40) // _row_h)
+            _n_e     = len(self.leaderboard.entries)
+            _max_scroll = max(0, _n_e - _max_rows)
+
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                self._show_stats_overlay = False
+            elif event.type == pygame.MOUSEWHEEL and self._stats_tab == 1:
+                self._table_scroll = max(
+                    0, min(_max_scroll, self._table_scroll - event.y)
+                )
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                _tab_w  = (_ow - 32) // 2
+                _close_x = pygame.Rect(_ox + _ow - 42, _oy + 10, 30, 30)
+                _tab0_r  = pygame.Rect(_lx,              _oy + 158, _tab_w, 34)
+                _tab1_r  = pygame.Rect(_lx + _tab_w + 4, _oy + 158, _tab_w, 34)
+                mx, my = event.pos
+                if _close_x.collidepoint(mx, my):
+                    self._show_stats_overlay = False
+                elif _tab0_r.collidepoint(mx, my):
+                    self._stats_tab = 0
+                elif _tab1_r.collidepoint(mx, my):
+                    self._stats_tab = 1
+                    # Auto-scroll so the current session is visible
+                    _sid2 = getattr(self, "_last_summary", {}).get("session_id", "")
+                    _cur_i = next(
+                        (i for i, e in enumerate(self.leaderboard.entries)
+                         if e.get("session_id", "") == _sid2),
+                        None
+                    )
+                    if _cur_i is not None:
+                        _target = max(0, _cur_i - _max_rows // 2)
+                        self._table_scroll = max(0, min(_max_scroll, _target))
+                elif self._stats_tab == 1:
+                    # Row click in ALL SESSIONS table
+                    if _lx <= mx <= _lx + _lw and my >= _tr_y0:
+                        screen_row = (my - _tr_y0) // _row_h
+                        abs_idx    = screen_row + self._table_scroll
+                        if 0 <= abs_idx < _n_e:
+                            self._selected_hist_idx = (
+                                None if self._selected_hist_idx == abs_idx else abs_idx
+                            )
+            return
         if self.state == STATE_MENU:
             self._menu_event(event)
         elif self.state == STATE_NAME_ENTRY:
@@ -132,6 +213,8 @@ class Game:
             self._leaderboard_event(event)
         elif self.state == STATE_PAUSED:
             self._paused_event(event)
+        elif self.state == STATE_BOSS_CUTSCENE:
+            self._boss_cutscene_event(event)
 
     def _menu_event(self, event):
         if event.type == pygame.KEYDOWN:
@@ -145,15 +228,18 @@ class Game:
                 pygame.event.post(pygame.event.Event(pygame.QUIT))
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mx, my = event.pos
-            play_rect  = pygame.Rect(SCREEN_WIDTH//2 - 130, 272, 260, 54)
-            lb_rect    = pygame.Rect(SCREEN_WIDTH//2 - 130, 342, 260, 54)
-            quit_rect  = pygame.Rect(SCREEN_WIDTH//2 - 130, 412, 260, 54)
+            play_rect  = pygame.Rect(SCREEN_WIDTH//2 - 130, 252, 260, 54)
+            lb_rect    = pygame.Rect(SCREEN_WIDTH//2 - 130, 316, 260, 54)
+            stats_rect = pygame.Rect(SCREEN_WIDTH//2 - 130, 380, 260, 54)
+            quit_rect  = pygame.Rect(SCREEN_WIDTH//2 - 130, 444, 260, 54)
             if play_rect.collidepoint(mx, my):
                 self._name_input = ""
                 self.change_state(STATE_NAME_ENTRY)
             elif lb_rect.collidepoint(mx, my):
                 self._lb_scroll = 0
                 self.change_state(STATE_LEADERBOARD)
+            elif stats_rect.collidepoint(mx, my):
+                self._show_stats_overlay = True
             elif quit_rect.collidepoint(mx, my):
                 pygame.event.post(pygame.event.Event(pygame.QUIT))
 
@@ -175,6 +261,8 @@ class Game:
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 self.change_state(STATE_PAUSED)
+            if event.key == pygame.K_TAB:
+                self._show_stats_overlay = not self._show_stats_overlay
             if event.key in (pygame.K_SPACE, pygame.K_z, pygame.K_j):
                 self.player.start_attack(pygame.time.get_ticks())
             if event.key == pygame.K_e:
@@ -183,6 +271,9 @@ class Game:
                 self.player.use_fireball()
             if event.key == pygame.K_b:
                 self.player.use_area_attack(pygame.time.get_ticks())
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self._PAUSE_BTN.collidepoint(*event.pos):
+                self.change_state(STATE_PAUSED)
 
     def _merchant_event(self, event):
         if self._merchant:
@@ -204,11 +295,14 @@ class Game:
             mx, my = event.pos
             retry_rect = pygame.Rect(SCREEN_WIDTH//2 - 120, 506, 240, 48)
             menu_rect  = pygame.Rect(SCREEN_WIDTH//2 - 120, 560, 240, 48)
+            stats_rect = pygame.Rect(SCREEN_WIDTH//2 - 120, 614, 240, 48)
             if retry_rect.collidepoint(mx, my):
                 self._name_input = ""
                 self.change_state(STATE_NAME_ENTRY)
             elif menu_rect.collidepoint(mx, my):
                 self.change_state(STATE_MENU)
+            elif stats_rect.collidepoint(mx, my):
+                self._show_stats_overlay = True
 
     def _leaderboard_event(self, event):
         if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_m):
@@ -226,18 +320,34 @@ class Game:
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             self.change_state(STATE_PLAYING)
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            resume_rect = pygame.Rect(SCREEN_WIDTH//2 - 100, 320, 200, 52)
-            menu_rect   = pygame.Rect(SCREEN_WIDTH//2 - 100, 390, 200, 52)
+            resume_rect = pygame.Rect(SCREEN_WIDTH//2 - 90, 296, 180, 48)
+            menu_rect   = pygame.Rect(SCREEN_WIDTH//2 - 90, 356, 180, 48)
+            stats_rect  = pygame.Rect(SCREEN_WIDTH//2 - 90, 416, 180, 48)
             if resume_rect.collidepoint(*event.pos):
                 self.change_state(STATE_PLAYING)
             elif menu_rect.collidepoint(*event.pos):
                 self._end_session()
                 self.change_state(STATE_MENU)
+            elif stats_rect.collidepoint(*event.pos):
+                self._show_stats_overlay = True
+
+    def _boss_cutscene_event(self, event):
+        skip = False
+        if event.type == pygame.KEYDOWN:
+            skip = True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            skip = True
+        if skip:
+            self.change_state(STATE_PLAYING)
 
     # ------------------------------------------------------------------
     # UPDATE
     # ------------------------------------------------------------------
     def _update(self, dt: float):
+        if self.state == STATE_PLAYING and not self._show_stats_overlay:
+            self._play_time_ms += dt
+        if self._show_stats_overlay:
+            return   # freeze all game logic while stats panel is open
         if self.state == STATE_MENU:
             for s in self._menu_stars:
                 s["y"] -= s["speed"]
@@ -248,6 +358,11 @@ class Game:
             for o in self._menu_orbs:
                 o["phase"]  += o["speed"] * dt / 800.0
                 o["phase2"] += o["speed"] * dt / 1200.0
+            return
+        if self.state == STATE_BOSS_CUTSCENE:
+            elapsed = pygame.time.get_ticks() - getattr(self, "_cutscene_start_ms", 0)
+            if elapsed >= 5000:
+                self.change_state(STATE_PLAYING)
             return
         if self.state in (STATE_NAME_ENTRY, STATE_GAME_OVER,
                           STATE_LEADERBOARD, STATE_PAUSED, STATE_MERCHANT):
@@ -298,6 +413,52 @@ class Game:
                         {"x": enemy.x, "y": enemy.y, "start_ms": now,
                          "color": enemy.color}
                     )
+                    # Boss death — spectacular effect
+                    if hasattr(enemy, "phase"):
+                        self._shake_end      = now + 3000
+                        self._shake_amp      = 22
+                        self._boss_flash_end = now + 700
+                        self._color_drain_end = now + 2200
+                        self._slowmo_end     = now + 1800
+                        play_boss_death()
+                        # Wave 1: instant central burst (100 particles)
+                        for _bp in range(100):
+                            _ang  = random.uniform(0, math.pi * 2)
+                            _dist = random.uniform(0, 220)
+                            self._death_particles.append({
+                                "x": enemy.x + math.cos(_ang) * _dist * 0.3,
+                                "y": enemy.y + math.sin(_ang) * _dist * 0.3,
+                                "start_ms": now + random.randint(0, 300),
+                                "color": random.choice([
+                                    (255, 80, 20), (255, 200, 60),
+                                    (200, 60, 255), (255, 255, 180),
+                                    (60, 200, 255), (255, 30, 30),
+                                ]),
+                            })
+                        # Wave 2: delayed second burst
+                        for _bp in range(60):
+                            _ang  = random.uniform(0, math.pi * 2)
+                            _dist = random.uniform(50, 260)
+                            self._death_particles.append({
+                                "x": enemy.x + math.cos(_ang) * _dist * 0.5,
+                                "y": enemy.y + math.sin(_ang) * _dist * 0.5,
+                                "start_ms": now + random.randint(400, 900),
+                                "color": random.choice([
+                                    (255, 120, 40), (255, 240, 80),
+                                    (220, 80, 255), (80, 255, 200),
+                                ]),
+                            })
+
+        # Collect boss minion spawns (guarded)
+        try:
+            new_spawns = []
+            for enemy in self.floor.enemies:
+                if hasattr(enemy, "pending_spawns") and enemy.pending_spawns:
+                    new_spawns.extend(enemy.pending_spawns)
+                    enemy.pending_spawns.clear()
+            self.floor.enemies.extend(new_spawns)
+        except Exception:
+            pass
 
         # Remove dead enemies
         self.floor.enemies = [e for e in self.floor.enemies if e.alive]
@@ -410,6 +571,9 @@ class Game:
             self.player.wall_breaks = 3
             self.floor.apply_curse(self.player)
             self.combo_system.reset()
+            if new_floor.is_boss:
+                self._cutscene_start_ms = pygame.time.get_ticks()
+                self.change_state(STATE_BOSS_CUTSCENE)
 
     def next_floor(self):
         """Called after leaving merchant."""
@@ -419,10 +583,16 @@ class Game:
         self.player.wall_breaks = 3
         self.floor.apply_curse(self.player)
         self.combo_system.reset()
-        self.change_state(STATE_PLAYING)
+        if self.floor.is_boss:
+            self._cutscene_start_ms = pygame.time.get_ticks()
+            self.change_state(STATE_BOSS_CUTSCENE)
+        else:
+            self.change_state(STATE_PLAYING)
 
     # ------------------------------------------------------------------
     def _end_session(self):
+        # Cache stats NOW — export_csv() clears the log, so this must come first
+        self._last_session_stats = self._get_session_stats()
         summary = self.stat_tracker.generate_summary(
             self.current_floor_num, self.player.kills)
         summary["player_name"] = self._player_name
@@ -435,6 +605,7 @@ class Game:
 
     # ------------------------------------------------------------------
     def change_state(self, new_state: str):
+        self._show_stats_overlay = False
         self.state = new_state
 
     def _show_feedback(self, msg: str, duration_ms: int = 2000):
@@ -459,6 +630,10 @@ class Game:
             self._draw_leaderboard()
         elif self.state == STATE_PAUSED:
             self._draw_paused()
+        elif self.state == STATE_BOSS_CUTSCENE:
+            self._draw_boss_cutscene()
+        if self._show_stats_overlay:
+            self._draw_stats_overlay()
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -781,27 +956,83 @@ class Game:
 
         # ── Buttons ────────────────────────────────────────────────────
         bx2 = cx - 130
-        self._draw_button("Play",        bx2, 272, 260, 54, (55, 35, 115), icon=self._icon_play)
-        self._draw_button("Leaderboard", bx2, 342, 260, 54, (36, 56, 78),  icon=self._icon_lb)
-        self._draw_button("Quit",        bx2, 412, 260, 54, (76, 26, 38),  icon=self._icon_quit)
+        self._draw_button("Play",        bx2, 252, 260, 54, (55, 35, 115), icon=self._icon_play)
+        self._draw_button("Leaderboard", bx2, 316, 260, 54, (36, 56, 78),  icon=self._icon_lb)
+        self._draw_button("Stats",       bx2, 380, 260, 54, (28, 68, 68))
+        self._draw_button("Quit",        bx2, 444, 260, 54, (76, 26, 38),  icon=self._icon_quit)
 
-        # Key-hint strip below buttons
-        hint_y = 488
-        hint_bg = pygame.Surface((360, 28), pygame.SRCALPHA)
-        hint_bg.fill((8, 6, 18, 160))
-        pygame.draw.rect(hint_bg, (55, 42, 88, 100), (0, 0, 360, 28), 1, border_radius=6)
-        self.screen.blit(hint_bg, (cx - 180, hint_y))
-        hint2 = self.font_sm.render("WASD / Arrows  ·  Space / Z  ·  V  B  E", True, (100, 90, 145))
-        self.screen.blit(hint2, (cx - hint2.get_width()//2, hint_y + 6))
+        # Guide button (hover to show)
+        guide_rect = pygame.Rect(cx - 130, 508, 260, 30)
+        guide_hov  = guide_rect.collidepoint(*pygame.mouse.get_pos())
+        gb_col = (32, 58, 52) if guide_hov else (18, 34, 30)
+        gb_brd = (60, 180, 140) if guide_hov else (38, 90, 72)
+        pygame.draw.rect(self.screen, gb_col, guide_rect, border_radius=7)
+        pygame.draw.rect(self.screen, gb_brd, guide_rect, 1, border_radius=7)
+        gh = self.font_sm.render("? HOW TO PLAY", True,
+                                  (90, 220, 170) if guide_hov else (55, 140, 110))
+        self.screen.blit(gh, (cx - gh.get_width()//2, guide_rect.y + 8))
 
-        # Bottom atmosphere: subtle mist line
+        # Guide panel (shown on hover)
+        if guide_hov:
+            gp_w, gp_h = 400, 390
+            gp_x = cx - gp_w // 2
+            gp_y = guide_rect.y - gp_h - 6
+            gp = pygame.Surface((gp_w, gp_h), pygame.SRCALPHA)
+            gp.fill((6, 18, 14, 240))
+            pygame.draw.rect(gp, (60, 180, 130, 200), (0, 0, gp_w, gp_h), 1, border_radius=12)
+            self.screen.blit(gp, (gp_x, gp_y))
+
+            # Title
+            gtitle = self.font_med.render("GAME GUIDE", True, (80, 240, 180))
+            self.screen.blit(gtitle, (gp_x + gp_w//2 - gtitle.get_width()//2, gp_y + 10))
+            pygame.draw.line(self.screen, (50, 150, 110),
+                             (gp_x + 14, gp_y + 30), (gp_x + gp_w - 14, gp_y + 30), 1)
+
+            guide_lines = [
+                ("MOVEMENT",    None,          (90, 220, 170)),
+                ("WASD  or  Arrow Keys",       None, (175, 215, 200)),
+                ("",            None,          (0, 0, 0)),
+                ("COMBAT",      None,          (90, 220, 170)),
+                ("Space / Z / J",  "Attack",   (220, 195, 150)),
+                ("V",           "Fireball  (30 ST cost)",  (255, 140, 60)),
+                ("B",           "Area burst  (50 ST cost)",(80, 210, 255)),
+                ("E",           "Break wall",  (190, 155, 90)),
+                ("",            None,          (0, 0, 0)),
+                ("EXPLORE",     None,          (90, 220, 170)),
+                ("Kill enemies to open exit", None, (175, 215, 200)),
+                ("Step on exit door to advance floor", None, (175, 215, 200)),
+                ("Reach floor 20 and beat the boss to WIN!", None, (255, 230, 80)),
+                ("",            None,          (0, 0, 0)),
+                ("ITEMS  (dropped by enemies)", None, (90, 220, 170)),
+                ("Potion  Weapon  Armor  Buff  Gold", None, (175, 215, 200)),
+                ("Merchant shop every 5 floors", None, (255, 215, 0)),
+                ("",            None,          (0, 0, 0)),
+                ("STATS  &  UI",  None,        (90, 220, 170)),
+                ("ESC",         "Pause menu",  (220, 195, 150)),
+                ("TAB",         "Stats overlay (mid-game)", (220, 195, 150)),
+            ]
+            gl_y = gp_y + 36
+            for key, desc, gcol in guide_lines:
+                if not key:
+                    gl_y += 4
+                    continue
+                if desc is None:
+                    # Section header
+                    gs2 = self.font_sm.render(key, True, gcol)
+                    self.screen.blit(gs2, (gp_x + 14, gl_y))
+                else:
+                    ks2 = self.font_sm.render(key, True, (240, 210, 100))
+                    self.screen.blit(ks2, (gp_x + 14, gl_y))
+                    ds2 = self.font_sm.render(desc, True, gcol)
+                    self.screen.blit(ds2, (gp_x + 160, gl_y))
+                gl_y += 16
+
+        # Bottom mist
         mist = pygame.Surface((SCREEN_WIDTH, 80), pygame.SRCALPHA)
         for mi in range(40):
             ma = int(12 * (1 - mi / 40))
-            pygame.draw.rect(mist, (20, 16, 40, ma),
-                             (0, mi * 2, SCREEN_WIDTH, 2))
+            pygame.draw.rect(mist, (20, 16, 40, ma), (0, mi * 2, SCREEN_WIDTH, 2))
         self.screen.blit(mist, (0, SCREEN_HEIGHT - 80))
-
         hint3 = self.font_sm.render("WASD / Arrows to move   |   Space / Z to attack",
                                     True, (60, 54, 90))
         self.screen.blit(hint3, (cx - hint3.get_width()//2, SCREEN_HEIGHT - 36))
@@ -815,7 +1046,7 @@ class Game:
         for dp in self._death_particles:
             _el  = _now - dp["start_ms"]
             _dur = 800
-            if _el >= _dur:
+            if _el < 0 or _el >= _dur:
                 continue
             _prg = _el / _dur
             _dx, _dy = int(dp["x"]), int(dp["y"])
@@ -824,7 +1055,7 @@ class Game:
             if _prg < 0.15:
                 _fp  = _prg / 0.15
                 _fr  = int(30 * (1 - _fp))
-                _fa  = int(255 * (1 - _fp))
+                _fa  = max(0, min(255, int(255 * (1 - _fp))))
                 if _fr > 0:
                     _fls = pygame.Surface((_fr * 2 + 2, _fr * 2 + 2), pygame.SRCALPHA)
                     pygame.draw.circle(_fls, (255, 255, 200, _fa),
@@ -832,7 +1063,7 @@ class Game:
                     self.screen.blit(_fls, (_dx - _fr - 1, _dy - _fr - 1))
             # Smoke cloud — dark expanding semi-transparent disk
             _sr = int(6 + 52 * _prg)
-            _sa = int(80 * max(0, 1 - _prg * 1.4))
+            _sa = max(0, min(255, int(80 * max(0, 1 - _prg * 1.4))))
             _ss = pygame.Surface((_sr * 2, _sr * 2), pygame.SRCALPHA)
             pygame.draw.circle(_ss, (30, 25, 20, _sa), (_sr, _sr), _sr)
             self.screen.blit(_ss, (_dx - _sr, _dy - _sr))
@@ -884,17 +1115,56 @@ class Game:
                 pygame.draw.circle(_ps2, (*_col, _ba), (_sz + 1, _sz + 1), _sz)
                 self.screen.blit(_ps2, (_bx - _sz - 1, _by - _sz - 1))
 
-        self.hud.draw(self.screen, self.player, self.floor, self.combo_system)
+        self.hud.draw(self.screen, self.player, self.floor, self.combo_system,
+                      play_time_ms=self._play_time_ms)
 
         # Darkness curse (vignette)
         if self.floor.curse_type == "darkness":
             self._draw_vignette()
+
+        # Stats table overlay (Tab key)
+        if self._show_stats:
+            self._draw_stats_table()
+
+        # Pause button (top-right corner)
+        self._draw_pause_button()
 
         # Feedback
         now = pygame.time.get_ticks()
         if self._feedback_msg and now < self._feedback_expire:
             surf = self.font_med.render(self._feedback_msg, True, YELLOW)
             self.screen.blit(surf, (SCREEN_WIDTH//2 - surf.get_width()//2, 50))
+
+        # Boss death flash overlay
+        if now < self._boss_flash_end:
+            frac = (self._boss_flash_end - now) / 700.0
+            fla = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+            fla.fill((255, 255, 255, int(240 * frac)))
+            self.screen.blit(fla, (0, 0))
+
+        # Color drain (grayscale) — fades out over _color_drain_end window
+        if now < self._color_drain_end:
+            try:
+                drain_frac = max(0.0, (self._color_drain_end - now) / 2200.0)
+                arr = pygame.surfarray.pixels3d(self.screen)
+                gray = (0.299 * arr[:,:,0] + 0.587 * arr[:,:,1]
+                        + 0.114 * arr[:,:,2]).astype(np.uint8)
+                for ch in range(3):
+                    arr[:,:,ch] = (gray * drain_frac
+                                   + arr[:,:,ch] * (1 - drain_frac)).astype(np.uint8)
+                del arr   # release pixel lock
+            except Exception:
+                pass
+
+        # Screen shake
+        if now < self._shake_end:
+            amp = int(self._shake_amp * max(0.0, (self._shake_end - now) / 3000.0))
+            if amp > 0:
+                ox = random.randint(-amp, amp)
+                oy = random.randint(-amp, amp)
+                snap = self.screen.copy()
+                self.screen.fill((0, 0, 0))
+                self.screen.blit(snap, (ox, oy))
 
     def _draw_vignette(self):
         play_h = SCREEN_HEIGHT - 96   # clip to HUD_Y — never overlap the panel
@@ -910,6 +1180,97 @@ class Game:
         self.screen.blit(vig, (0, 0))
 
     # ------------------------------------------------------------------
+    def _draw_stats_table(self):
+        """Tab-toggled in-game stats overlay panel."""
+        p   = self.player
+        fl  = self.floor
+        cx  = SCREEN_WIDTH // 2
+        pw, ph = 420, 240
+        px  = cx - pw // 2
+        py  = 60
+
+        # Panel background
+        bg = pygame.Surface((pw, ph), pygame.SRCALPHA)
+        bg.fill((6, 4, 18, 220))
+        pygame.draw.rect(bg, (90, 68, 160, 220), (0, 0, pw, ph), 2, border_radius=12)
+        pygame.draw.rect(bg, (55, 42, 100, 80),  (4, 4, pw - 8, ph - 8), 1, border_radius=10)
+        self.screen.blit(bg, (px, py))
+
+        fm = pygame.font.SysFont("monospace", 14, bold=True)
+        fs = pygame.font.SysFont("monospace", 13)
+
+        # Title row
+        hdr = fm.render("PLAYER STATS", True, (180, 150, 255))
+        self.screen.blit(hdr, (cx - hdr.get_width() // 2, py + 10))
+        pygame.draw.line(self.screen, (75, 58, 120),
+                         (px + 14, py + 28), (px + pw - 14, py + 28), 1)
+
+        # Two-column table
+        col_left  = px + 22
+        col_right = px + pw // 2 + 10
+        rows_l = [
+            ("Level",   str(p.level),              (210, 185, 255)),
+            ("HP",      f"{p.hp}/{p.max_hp}",      (80, 220, 100)),
+            ("Stamina", f"{int(p.stamina)}/{p.max_stamina}", (70, 200, 140)),
+            ("ATK",     str(p.attack),              (235, 180, 60)),
+            ("DEF",     str(p.defense),             (80, 160, 240)),
+            ("Gold",    str(p.gold),                (255, 215, 0)),
+        ]
+        rows_r = [
+            ("Floor",   str(fl.floor_num),          (185, 160, 255)),
+            ("Kills",   str(p.kills),               (220, 100, 100)),
+            ("Enemies", str(sum(1 for e in fl.enemies if e.alive)), (255, 130, 50)),
+            ("Items",   str(sum(1 for i in fl.items if not i.collected)), (120, 200, 255)),
+            ("Curse",   fl.curse_type.replace("_", " ").title() if fl.curse_type != "none" else "None",
+             (255, 185, 30) if fl.curse_type != "none" else (120, 110, 150)),
+            ("Boss Fl", "Yes" if fl.is_boss else "No",
+             (255, 80, 60) if fl.is_boss else (100, 100, 130)),
+        ]
+        for i, (lbl, val, col) in enumerate(rows_l):
+            ry = py + 36 + i * 30
+            # Row stripe
+            if i % 2 == 0:
+                stripe = pygame.Surface((pw // 2 - 16, 26), pygame.SRCALPHA)
+                stripe.fill((255, 255, 255, 6))
+                self.screen.blit(stripe, (col_left - 4, ry - 2))
+            key_s = fs.render(lbl, True, (150, 135, 180))
+            val_s = fm.render(val, True, col)
+            self.screen.blit(key_s, (col_left, ry))
+            self.screen.blit(val_s, (col_left + 90, ry))
+        for i, (lbl, val, col) in enumerate(rows_r):
+            ry = py + 36 + i * 30
+            if i % 2 == 0:
+                stripe = pygame.Surface((pw // 2 - 16, 26), pygame.SRCALPHA)
+                stripe.fill((255, 255, 255, 6))
+                self.screen.blit(stripe, (col_right - 4, ry - 2))
+            key_s = fs.render(lbl, True, (150, 135, 180))
+            val_s = fm.render(val, True, col)
+            self.screen.blit(key_s, (col_right, ry))
+            self.screen.blit(val_s, (col_right + 90, ry))
+
+        pygame.draw.line(self.screen, (65, 50, 105),
+                         (cx, py + 30), (cx, py + ph - 10), 1)
+
+        hint = pygame.font.SysFont("monospace", 11).render(
+            "[TAB] toggle stats", True, (80, 70, 110))
+        self.screen.blit(hint, (px + pw - hint.get_width() - 8, py + ph - 16))
+
+    # ------------------------------------------------------------------
+    _PAUSE_BTN = pygame.Rect(SCREEN_WIDTH - 52, 8, 44, 28)
+
+    def _draw_pause_button(self):
+        r    = self._PAUSE_BTN
+        hov  = r.collidepoint(*pygame.mouse.get_pos())
+        bg_c = (70, 55, 110) if hov else (40, 32, 68)
+        pygame.draw.rect(self.screen, bg_c, r, border_radius=6)
+        pygame.draw.rect(self.screen, (120, 90, 200) if hov else (80, 62, 130),
+                         r, 1, border_radius=6)
+        # Two vertical bars (pause symbol)
+        bx, by = r.x + 12, r.y + 8
+        pygame.draw.rect(self.screen, (210, 190, 255), (bx, by, 5, 12), border_radius=2)
+        pygame.draw.rect(self.screen, (210, 190, 255), (bx + 11, by, 5, 12), border_radius=2)
+
+    # ------------------------------------------------------------------
     def _draw_merchant(self):
         if self._merchant:
             self._merchant.draw(self.screen, self.player)
@@ -918,6 +1279,116 @@ class Game:
             if self._feedback_msg and now < self._feedback_expire:
                 surf = self.font_med.render(self._feedback_msg, True, YELLOW)
                 self.screen.blit(surf, (SCREEN_WIDTH//2 - surf.get_width()//2, 130))
+
+    # ------------------------------------------------------------------
+    def _draw_boss_cutscene(self):
+        t       = pygame.time.get_ticks() / 1000.0
+        elapsed = pygame.time.get_ticks() - getattr(self, "_cutscene_start_ms", 0)
+        prog    = min(1.0, elapsed / 5000.0)   # 0→1 over 5 seconds
+        cx      = SCREEN_WIDTH  // 2
+        cy      = SCREEN_HEIGHT // 2
+        floor_n = self.current_floor_num
+
+        # ── Blood-red gradient background ──────────────────────────────
+        for row in range(SCREEN_HEIGHT):
+            frac = row / SCREEN_HEIGHT
+            r = int(22 + 30 * (1 - frac))
+            g = int(4  +  4 * (1 - frac))
+            b = int(6  +  4 * (1 - frac))
+            pygame.draw.rect(self.screen, (r, g, b), (0, row, SCREEN_WIDTH, 1))
+
+        # ── Animated dark radial vignette ───────────────────────────────
+        vig = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        for ri in range(380, 0, -20):
+            va = int(160 * (1 - ri / 380))
+            pygame.draw.circle(vig, (0, 0, 0, va), (cx, cy), ri)
+        pygame.draw.circle(vig, (0, 0, 0, 0), (cx, cy), 200)
+        self.screen.blit(vig, (0, 0))
+
+        # ── Red lightning bolts emanating from centre ───────────────────
+        rng_bolt = random.Random(int(t * 12))
+        bolt_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        for _ in range(6):
+            ang = rng_bolt.uniform(0, math.pi * 2)
+            seg_x, seg_y = cx, cy
+            for seg in range(rng_bolt.randint(4, 8)):
+                nx = seg_x + int(math.cos(ang) * rng_bolt.randint(30, 80))
+                ny = seg_y + int(math.sin(ang) * rng_bolt.randint(30, 80))
+                ang += rng_bolt.uniform(-0.6, 0.6)
+                ba  = int(rng_bolt.randint(60, 180))
+                pygame.draw.line(bolt_surf, (255, 50, 30, ba), (seg_x, seg_y), (nx, ny), 2)
+                seg_x, seg_y = nx, ny
+        self.screen.blit(bolt_surf, (0, 0))
+
+        # ── BOSS FLOOR label (fade in) ──────────────────────────────────
+        fade_in = min(1.0, prog * 4)        # fully visible by 25%
+        lbl_a   = int(255 * fade_in)
+
+        font_xl2   = pygame.font.SysFont("monospace", 18, bold=True)
+        floor_txt  = font_xl2.render(f"FLOOR  {floor_n}", True, (200, 80, 60))
+        floor_txt.set_alpha(lbl_a)
+        self.screen.blit(floor_txt,
+                         (cx - floor_txt.get_width() // 2, cy - 130))
+
+        # ── "BOSS ENCOUNTER" animated title ────────────────────────────
+        font_boss = pygame.font.SysFont("monospace", 56, bold=True)
+        pulse_t   = 0.85 + 0.15 * math.sin(t * 3.5)
+        rc        = int(255 * pulse_t)
+        boss_col  = (rc, int(40 * pulse_t), int(30 * pulse_t))
+        # Glow behind text
+        for gd in range(8, 0, -2):
+            gs  = font_boss.render("BOSS ENCOUNTER", True, (100, 10, 10))
+            gs.set_alpha(int(30 * (gd / 8) * fade_in))
+            for dx2, dy2 in [(-gd, 0), (gd, 0), (0, -gd), (0, gd)]:
+                self.screen.blit(gs, (cx - gs.get_width() // 2 + dx2, cy - 40 + dy2))
+        title_s = font_boss.render("BOSS ENCOUNTER", True, boss_col)
+        title_s.set_alpha(lbl_a)
+        self.screen.blit(title_s, (cx - title_s.get_width() // 2, cy - 42))
+
+        # Decorative lines flanking title
+        tw = title_s.get_width()
+        lw2 = tw + 80
+        line_a = lbl_a
+        line_surf = pygame.Surface((lw2, 4), pygame.SRCALPHA)
+        for xi in range(lw2):
+            frac2 = abs(xi / lw2 - 0.5) * 2   # 0 centre → 1 edge
+            ca = int(line_a * (1 - frac2 * 0.7))
+            pygame.draw.line(line_surf, (220, 50, 30, ca), (xi, 1), (xi, 3))
+        self.screen.blit(line_surf, (cx - lw2 // 2, cy - 50))
+        self.screen.blit(line_surf, (cx - lw2 // 2, cy + 20))
+
+        # ── Boss name / flavour ─────────────────────────────────────────
+        font_sub2  = pygame.font.SysFont("monospace", 20, bold=True)
+        name_s  = font_sub2.render("The Orc Warlord", True, (230, 160, 50))
+        name_s.set_alpha(lbl_a)
+        self.screen.blit(name_s, (cx - name_s.get_width() // 2, cy + 34))
+
+        font_flav = pygame.font.SysFont("monospace", 14)
+        lines = [
+            "A warlord draped in ancient armour rises from the shadows.",
+            "His warcry shakes the very stones of the tower.",
+            "Minions surge at his command — prepare yourself.",
+        ]
+        for li, line in enumerate(lines):
+            fa2 = min(1.0, max(0.0, prog * 5 - 0.5 - li * 0.25))
+            ls  = font_flav.render(line, True, (190, 140, 130))
+            ls.set_alpha(int(255 * fa2))
+            self.screen.blit(ls, (cx - ls.get_width() // 2, cy + 78 + li * 22))
+
+        # ── "Press any key" prompt (blinks in last 50%) ─────────────────
+        if prog > 0.4:
+            blink_a = int(200 * abs(math.sin(t * 3.5)))
+            skip_s  = font_flav.render("Press any key to begin the battle", True, (220, 200, 180))
+            skip_s.set_alpha(blink_a)
+            self.screen.blit(skip_s, (cx - skip_s.get_width() // 2, SCREEN_HEIGHT - 72))
+
+        # ── Countdown bar at bottom ──────────────────────────────────────
+        bar_w = int(SCREEN_WIDTH * 0.5 * (1 - prog))
+        bar_x = cx - bar_w // 2
+        bar_y = SCREEN_HEIGHT - 32
+        pygame.draw.rect(self.screen, (60, 10, 10), (cx - SCREEN_WIDTH // 4, bar_y, SCREEN_WIDTH // 2, 8), border_radius=4)
+        if bar_w > 0:
+            pygame.draw.rect(self.screen, (220, 50, 30), (bar_x, bar_y, bar_w, 8), border_radius=4)
 
     # ------------------------------------------------------------------
     def _draw_name_entry(self):
@@ -1235,7 +1706,7 @@ class Game:
         combo_v = summary.get("max_combo", 0)
         dur     = summary.get("duration_sec", 0)
         sid     = summary.get("session_id", "")
-        dur_str = f"{int(dur//60)}m {int(dur%60):02d}s"
+        dur_str = self._fmt_time(dur)
 
         card_x, card_y, card_w, card_h = cx - 290, 158, 580, 136
         # Card background with animated edge glow
@@ -1312,7 +1783,7 @@ class Game:
             top3 = self.leaderboard.get_speed_top3()
             for j, entry in enumerate(top3[:3]):
                 d   = float(entry.get("duration_sec", 0))
-                ts  = f"{int(d//60)}m {int(d%60):02d}s"
+                ts  = self._fmt_time(d)
                 nm  = str(entry.get("player_name", "?"))[:12]
                 col = RANK_COL.get(j + 1, WHITE)
                 tag = "  <- YOU" if entry.get("session_id") == sid else ""
@@ -1340,7 +1811,7 @@ class Game:
                              (cx + rk_w // 2 - 14, rk_y + 32), 1)
             for j, entry in enumerate(ctx_entries):
                 d   = float(entry.get("duration_sec", 0))
-                ts  = f"{int(d//60)}m {int(d%60):02d}s"
+                ts  = self._fmt_time(d)
                 nm  = str(entry.get("player_name", "?"))[:12]
                 fl  = entry.get("floor_reached", 0)
                 rk  = entry.get("rank", "?")
@@ -1357,6 +1828,7 @@ class Game:
         # ── Buttons ────────────────────────────────────────────────────
         self._draw_button("Retry",     cx - 120, 506, 240, 48, (65, 28, 85))
         self._draw_button("Main Menu", cx - 120, 560, 240, 48, (28, 48, 72))
+        self._draw_button("Stats",     cx - 120, 614, 240, 48, (28, 68, 68))
 
     # ------------------------------------------------------------------
     def _draw_leaderboard(self):
@@ -1434,7 +1906,7 @@ class Game:
         for i, e in enumerate(entries):
             abs_rank = start + i + 1
             dur = float(e.get("duration_sec", 0))
-            ts  = f"{int(dur//60)}m{int(dur%60):02d}s"
+            ts  = self._fmt_time(dur)
             won_flag = str(e.get("won", "0"))
             vals = {
                 "rank":          f"#{abs_rank}",
@@ -1492,7 +1964,7 @@ class Game:
         self.screen.blit(ov, (0, 0))
 
         # Decorative panel box
-        pw, ph = 340, 240
+        pw, ph = 340, 300
         px, py = cx - pw // 2, 180
         panel  = pygame.Surface((pw, ph), pygame.SRCALPHA)
         panel.fill((10, 8, 24, 210))
@@ -1529,6 +2001,7 @@ class Game:
 
         self._draw_button("Resume",    cx - 90, 296, 180, 48, (38, 58, 100))
         self._draw_button("Main Menu", cx - 90, 356, 180, 48, (58, 28, 58))
+        self._draw_button("Stats",     cx - 90, 416, 180, 48, (28, 68, 68))
 
     # ------------------------------------------------------------------
     def _draw_button(self, text: str, x: int, y: int, w: int, h: int,
@@ -1581,6 +2054,838 @@ class Game:
                                     rect.centery - surf.get_height() // 2 + 1))
             self.screen.blit(surf, (rect.centerx - surf.get_width() // 2,
                                     rect.centery - surf.get_height() // 2))
+
+    # ------------------------------------------------------------------
+    # SESSION STATS HELPERS
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fmt_time(seconds: float) -> str:
+        s = max(0, int(seconds))
+        return f"{s // 60}:{s % 60:02d}"
+
+    def _get_hist_stats(self) -> dict:
+        """Aggregate historical stats from in-memory leaderboard (fast, no CSV read)."""
+        entries = self.leaderboard.entries
+        n = len(entries)
+        if n == 0:
+            return {
+                "total_sessions": 0, "wins": 0, "win_rate": 0.0,
+                "best_floor": 0, "best_kills": 0, "best_combo": 0,
+                "best_time_sec": None, "avg_kills": 0.0, "avg_floor": 0.0,
+                "avg_time_sec": 0.0, "floor_dist": {},
+            }
+        wins = [e for e in entries if int(e.get("floor_reached", 0)) >= 20]
+        avg_kills    = sum(int(e.get("kills", 0)) for e in entries) / n
+        avg_floor    = sum(int(e.get("floor_reached", 0)) for e in entries) / n
+        avg_time_sec = sum(float(e.get("duration_sec", 0)) for e in entries) / n
+        best_floor   = max(int(e.get("floor_reached", 0)) for e in entries)
+        best_kills   = max(int(e.get("kills", 0)) for e in entries)
+        best_combo   = max(int(e.get("max_combo", 0)) for e in entries)
+        best_time_sec = (min(float(e.get("duration_sec", 9999)) for e in wins)
+                         if wins else None)
+        win_rate   = round(len(wins) / n * 100, 1)
+        floor_dist: dict[int, int] = {}
+        for e in entries:
+            f = max(1, min(20, int(e.get("floor_reached", 1))))
+            floor_dist[f] = floor_dist.get(f, 0) + 1
+        return {
+            "total_sessions": n,
+            "wins":           len(wins),
+            "win_rate":       win_rate,
+            "best_floor":     best_floor,
+            "best_kills":     best_kills,
+            "best_combo":     best_combo,
+            "best_time_sec":  best_time_sec,
+            "avg_kills":      round(avg_kills, 1),
+            "avg_floor":      round(avg_floor, 1),
+            "avg_time_sec":   avg_time_sec,
+            "floor_dist":     floor_dist,
+        }
+
+    def _get_session_stats(self) -> dict:
+        log = self.stat_tracker.log
+        play_sec = self._play_time_ms / 1000.0
+
+        kills_by_type: dict[str, int] = {}
+        total_kills = 0
+        for r in log:
+            if r["event_type"] == "enemies_defeated":
+                et = r.get("enemy_type") or "unknown"
+                kills_by_type[et] = kills_by_type.get(et, 0) + 1
+                total_kills += 1
+
+        combos = [int(r["combo_count"]) for r in log
+                  if r.get("combo_count") not in ("", None)]
+        max_combo = max(combos, default=0)
+
+        items_by_type: dict[str, int] = {}
+        for r in log:
+            if r["event_type"] == "items_collected":
+                it = r.get("item_type") or "unknown"
+                items_by_type[it] = items_by_type.get(it, 0) + 1
+
+        hp_timeline: list[tuple[float, int, int]] = []
+        for r in log:
+            if r["event_type"] == "player_hp_over_time":
+                try:
+                    hp_timeline.append((float(r["timestamp"]),
+                                        int(r["hp"]),
+                                        int(r["max_hp"] or 100)))
+                except (ValueError, TypeError):
+                    pass
+
+        gold_spent = 0
+        for r in log:
+            try:
+                if r.get("gold_spent") not in ("", None):
+                    gold_spent += int(r["gold_spent"])
+            except (ValueError, TypeError):
+                pass
+
+        curses: list[str] = []
+        for r in log:
+            if r["event_type"] == "floor_curse_types":
+                ct = r.get("curse_type", "none")
+                if ct and ct != "none":
+                    curses.append(ct)
+
+        return {
+            "play_sec":      play_sec,
+            "floor_reached": self.current_floor_num,
+            "total_kills":   total_kills,
+            "kills_by_type": kills_by_type,
+            "max_combo":     max_combo,
+            "items_by_type": items_by_type,
+            "hp_timeline":   hp_timeline,
+            "gold_spent":    gold_spent,
+            "curses":        curses,
+        }
+
+    # ── internal drawing primitives used only by _draw_stats_overlay ─
+    @staticmethod
+    def _donut_slice(surface, cx, cy, r_out, r_in, a0, a1, color):
+        """Polygon-based donut slice: clockwise from a0→a1 (a0>a1 means CW in our coords)."""
+        steps = max(14, int(abs(a1 - a0) * r_out / 4))
+        angles = [a0 + (a1 - a0) * i / steps for i in range(steps + 1)]
+        outer = [(cx + r_out * math.cos(a), cy - r_out * math.sin(a)) for a in angles]
+        inner = [(cx + r_in  * math.cos(a), cy - r_in  * math.sin(a)) for a in angles]
+        pts   = [(int(x), int(y)) for x, y in outer + inner[::-1]]
+        if len(pts) >= 3:
+            pygame.draw.polygon(surface, color, pts)
+
+    @staticmethod
+    def _panel(surface, x, y, w, h, bg=(18, 14, 38), border=(65, 50, 110)):
+        s = pygame.Surface((w, h), pygame.SRCALPHA)
+        s.fill((*bg, 195))
+        pygame.draw.rect(s, (*border, 180), (0, 0, w, h), 1, border_radius=8)
+        surface.blit(s, (x, y))
+
+    def _draw_stats_overlay(self):   # noqa: C901
+        cx = SCREEN_WIDTH // 2
+        t  = pygame.time.get_ticks() / 1000.0
+        mx_m, my_m = pygame.mouse.get_pos()
+
+        # Full-screen dim with vignette
+        dim = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 195))
+        self.screen.blit(dim, (0, 0))
+
+        # ── Panel 940×640 ─────────────────────────────────────────────
+        pw, ph = 940, 640
+        px = (SCREEN_WIDTH  - pw) // 2   # 10
+        py = (SCREEN_HEIGHT - ph) // 2   # 40
+
+        # ── Gradient panel background ──────────────────────────────────
+        panel_s = pygame.Surface((pw, ph), pygame.SRCALPHA)
+        for row in range(ph):
+            frac = row / ph
+            r2 = int(8  + 10 * (1 - frac))
+            g2 = int(6  +  6 * (1 - frac))
+            b2 = int(20 + 18 * (1 - frac))
+            pygame.draw.rect(panel_s, (r2, g2, b2, 252), (0, row, pw, 1))
+        # Header band — distinct dark-purple strip
+        for row in range(64):
+            frac = row / 64
+            pygame.draw.rect(panel_s, (20, 14, 46, 252), (0, row, pw, 1))
+        self.screen.blit(panel_s, (px, py))
+        pygame.draw.rect(self.screen, (18, 12, 38), (px, py, pw, 64))
+
+        # Animated glowing border
+        glow_a = 0.75 + 0.25 * math.sin(t * 1.6)
+        for gd in range(5, 0, -1):
+            ga = int(70 * (1 - gd / 6) * glow_a)
+            gc = (int(100 * glow_a), int(65 * glow_a), int(200 * glow_a))
+            pygame.draw.rect(self.screen, (*gc, ga),
+                             (px - gd, py - gd, pw + gd*2, ph + gd*2),
+                             1, border_radius=16 + gd)
+        pygame.draw.rect(self.screen, (100, 72, 185), (px, py, pw, ph), 2, border_radius=16)
+        pygame.draw.rect(self.screen, (55, 42, 98, 140),
+                         (px+4, py+4, pw-8, ph-8), 1, border_radius=13)
+
+        # ── Data ──────────────────────────────────────────────────────
+        # Use live stats while playing; use cached copy after session ends
+        # (export_csv clears the log, so live read would return all zeros)
+        stats = (self._get_session_stats()
+                 if self.state == STATE_PLAYING
+                 else (self._last_session_stats or self._get_session_stats()))
+        hist       = self._get_hist_stats()
+        play_sec   = stats["play_sec"]
+        total_k    = stats["total_kills"]
+        hp_data    = stats["hp_timeline"]
+        pname      = getattr(self, "_last_summary", {}).get("player_name", self._player_name)
+        summary    = getattr(self, "_last_summary", {})
+        sid        = summary.get("session_id", "")
+        p_rank, p_total, _, _ = self.leaderboard.get_player_context(sid)
+
+        enemy_order = ["goblin","slime","skeleton","orc","wraith","armored_orc","werebear"]
+        enemy_cols  = [(80,200,80),(100,220,140),(200,200,200),
+                       (200,100,60),(160,80,220),(120,140,200),(200,140,60)]
+
+        # ── Header band ───────────────────────────────────────────────
+        # Diamond accent left
+        pygame.draw.polygon(self.screen, (130, 95, 220),
+                            [(px+14, py+32),(px+22, py+24),(px+30, py+32),(px+22, py+40)])
+        pygame.draw.polygon(self.screen, (180, 145, 255),
+                            [(px+14, py+32),(px+22, py+24),(px+30, py+32),(px+22, py+40)], 1)
+        title_s = self.font_big.render("SESSION  STATISTICS", True, (200, 175, 255))
+        self.screen.blit(title_s, (px + 36, py + 22))
+
+        # Player name badge (center)
+        badge_txt = f"  {pname[:14]}  "
+        bs = self.font_med.render(badge_txt, True, (240, 220, 100))
+        bw2 = bs.get_width() + 4
+        badge_bg = pygame.Surface((bw2, 26), pygame.SRCALPHA)
+        badge_bg.fill((60, 48, 12, 200))
+        pygame.draw.rect(badge_bg, (200, 165, 40, 200), (0, 0, bw2, 26), 1, border_radius=13)
+        self.screen.blit(badge_bg, (cx - bw2//2, py + 19))
+        self.screen.blit(bs, (cx - bs.get_width()//2, py + 22))
+
+        # Meta pills top-right
+        pill_defs = [
+            (f"{hist['total_sessions']} runs",  (48, 38, 82),  (155, 140, 200)),
+            (f"Win {hist['win_rate']}%",
+             (28, 72, 44) if hist["win_rate"] >= 20 else (72, 28, 38),
+             (90, 220, 120) if hist["win_rate"] >= 20 else (220, 90, 90)),
+            (f"Best Fl.{hist['best_floor']}",   (38, 55, 100), (100, 160, 255)),
+        ]
+        pill_x = px + pw - 52
+        for ptxt, pcol, ptc in reversed(pill_defs):
+            ps2  = self.font_sm.render(ptxt, True, ptc)
+            pw3  = ps2.get_width() + 20
+            pill_x -= pw3 + 6
+            pb2 = pygame.Surface((pw3, 24), pygame.SRCALPHA)
+            pb2.fill((*pcol, 220))
+            pygame.draw.rect(pb2, (*ptc, 120), (0, 0, pw3, 24), 1, border_radius=12)
+            self.screen.blit(pb2, (pill_x, py + 20))
+            self.screen.blit(ps2, (pill_x + 10, py + 23))
+
+        # Rank badge (if ranked)
+        if p_rank > 0:
+            rk_txt = f"#{p_rank}"
+            rk_col = (255, 215, 0) if p_rank <= 3 else (180, 160, 220)
+            rk_bg  = (70, 52, 12) if p_rank <= 3 else (38, 30, 65)
+            rks    = self.font_med.render(rk_txt, True, rk_col)
+            rkw    = rks.get_width() + 18
+            rkb    = pygame.Surface((rkw, 26), pygame.SRCALPHA)
+            rkb.fill((*rk_bg, 220))
+            pygame.draw.rect(rkb, (*rk_col, 160), (0, 0, rkw, 26), 1, border_radius=13)
+            self.screen.blit(rkb, (pill_x - rkw - 8, py + 19))
+            self.screen.blit(rks, (pill_x - rkw - 8 + 9, py + 22))
+
+        # Close button
+        close_rect = pygame.Rect(px + pw - 42, py + 17, 30, 30)
+        close_hov  = close_rect.collidepoint(mx_m, my_m)
+        pygame.draw.rect(self.screen, (200, 48, 48) if close_hov else (100, 38, 78),
+                         close_rect, border_radius=8)
+        pygame.draw.rect(self.screen, (240, 140, 140) if close_hov else (155, 85, 120),
+                         close_rect, 1, border_radius=8)
+        xs = self.font_med.render("X", True, WHITE)
+        self.screen.blit(xs, (close_rect.centerx - xs.get_width()//2,
+                               close_rect.centery - xs.get_height()//2))
+
+        # Header bottom separator with gradient
+        for gi in range(4):
+            ga2 = 180 - gi * 40
+            pygame.draw.line(self.screen, (88, 62, 165, ga2),
+                             (px + 10, py + 64 + gi), (px + pw - 10, py + 64 + gi), 1)
+
+        # ── Stat cards (5) ────────────────────────────────────────────
+        card_defs = [
+            ("FLOOR",      str(stats["floor_reached"]), (65, 108, 205),  (40, 70, 160)),
+            ("KILLS",      str(total_k),                (210,  62,  62),  (140, 30, 30)),
+            ("TIME",       self._fmt_time(play_sec),    (45, 190, 120),   (20, 120, 70)),
+            ("MAX COMBO",  f"x{stats['max_combo']}",   (210, 158,  28),  (140, 100, 10)),
+            ("GOLD SPENT", f"{stats['gold_spent']}g",  (230, 192,   0),  (150, 118,  0)),
+        ]
+        nc     = len(card_defs)
+        gap_c  = 8
+        cw_c   = (pw - 28 - gap_c * (nc - 1)) // nc
+        ch_c   = 76
+        cy0    = py + 70
+
+        for i, (lbl, val, bc, dark_bc) in enumerate(card_defs):
+            bx = px + 14 + i * (cw_c + gap_c)
+            hover_c = pygame.Rect(bx, cy0, cw_c, ch_c).collidepoint(mx_m, my_m)
+            # Card surface
+            cb = pygame.Surface((cw_c, ch_c), pygame.SRCALPHA)
+            for row in range(ch_c):
+                a_frac = row / ch_c
+                br  = int(dark_bc[0] + (bc[0] - dark_bc[0]) * 0.1 * (1 - a_frac))
+                bg3 = int(dark_bc[1] + (bc[1] - dark_bc[1]) * 0.1 * (1 - a_frac))
+                bb3 = int(dark_bc[2] + (bc[2] - dark_bc[2]) * 0.1 * (1 - a_frac))
+                pygame.draw.rect(cb, (br, bg3, bb3, 235), (0, row, cw_c, 1))
+            # Top accent band
+            for row in range(5):
+                aa = 255 - row * 30
+                pygame.draw.rect(cb, (*bc, aa), (0, row, cw_c, 1))
+            # Border
+            brd_a = 200 + int(40 * math.sin(t * 2 + i)) if hover_c else 140
+            pygame.draw.rect(cb, (*bc, brd_a), (0, 0, cw_c, ch_c), 1, border_radius=10)
+            # Left accent bar
+            pygame.draw.rect(cb, (*bc, 255), (0, 0, 4, ch_c), border_radius=2)
+            # Top shine
+            shine = pygame.Surface((cw_c, 22), pygame.SRCALPHA)
+            shine.fill((255, 255, 255, 18 if not hover_c else 28))
+            cb.blit(shine, (0, 0))
+            self.screen.blit(cb, (bx, cy0))
+            # Label
+            ls2 = self.font_sm.render(lbl, True, bc)
+            self.screen.blit(ls2, (bx + cw_c//2 - ls2.get_width()//2, cy0 + 9))
+            # Value — 32pt fits within 76px card, fall back for wide strings
+            vs2 = self.font_card.render(val, True, WHITE)
+            if vs2.get_width() > cw_c - 12:
+                vs2 = self.font_big.render(val, True, WHITE)
+            if vs2.get_width() > cw_c - 12:
+                vs2 = self.font_med.render(val, True, WHITE)
+            # Vertically center value in card below the label
+            v_y = cy0 + 28 + (ch_c - 28 - vs2.get_height()) // 2
+            self.screen.blit(vs2, (bx + cw_c//2 - vs2.get_width()//2, v_y))
+
+        # Separator with glow dot
+        sep_y = py + 152
+        pygame.draw.line(self.screen, (55, 42, 92), (px + 10, sep_y), (px + pw - 10, sep_y), 1)
+        pygame.draw.circle(self.screen, (110, 82, 188), (cx, sep_y), 4)
+        pygame.draw.circle(self.screen, (160, 130, 235), (cx, sep_y), 2)
+
+        # ── Tab bar ───────────────────────────────────────────────────
+        tab_y   = py + 158
+        tab_h   = 34
+        tab_w   = (pw - 32) // 2   # 454
+        tab_rects = [
+            pygame.Rect(px + 14,              tab_y, tab_w, tab_h),
+            pygame.Rect(px + 14 + tab_w + 4,  tab_y, tab_w, tab_h),
+        ]
+        tab_labels = ["SESSION STATS", "ALL SESSIONS"]
+        for t_i, (t_rect, t_lbl) in enumerate(zip(tab_rects, tab_labels)):
+            active   = (self._stats_tab == t_i)
+            tab_hov  = t_rect.collidepoint(mx_m, my_m)
+            tb_bg    = (50, 40, 90) if active else ((30, 24, 52) if tab_hov else (18, 14, 36))
+            tb_brd   = (140, 108, 215) if active else (65, 52, 100)
+            tb_tc    = (230, 215, 255) if active else (110, 95, 148)
+            pygame.draw.rect(self.screen, tb_bg, t_rect, border_radius=7)
+            pygame.draw.rect(self.screen, tb_brd, t_rect, 1, border_radius=7)
+            if active:
+                # Bright underline for active tab
+                pygame.draw.rect(self.screen, (145, 108, 240),
+                                 (t_rect.x + 4, t_rect.y + tab_h - 4,
+                                  t_rect.w - 8, 4), border_radius=3)
+                # Top shine
+                sh2 = pygame.Surface((t_rect.w - 8, 12), pygame.SRCALPHA)
+                sh2.fill((255, 255, 255, 22))
+                self.screen.blit(sh2, (t_rect.x + 4, t_rect.y + 2))
+            tls = self.font_med.render(t_lbl, True, tb_tc)
+            self.screen.blit(tls, (t_rect.centerx - tls.get_width()//2,
+                                   t_rect.centery - tls.get_height()//2 - 2))
+
+        # ── Column geometry ───────────────────────────────────────────
+        lx     = px + 14
+        lw     = 548
+        rx     = px + 572
+        rw     = pw - 572 - 14   # 354
+        cy_l   = py + 198
+        cy_r   = py + 198
+        lbl_w  = 88
+        bar_bw = lw - lbl_w - 80   # leaves ~80px right margin for count + pct text
+
+        # helper: draw an all-time records panel
+        def _draw_records_panel(ry):
+            rph2 = 28 + 5 * 18
+            self._panel(self.screen, rx, ry, rw, rph2, border=(55, 82, 55))
+            self.screen.blit(
+                self.font_sm.render("ALL-TIME RECORDS", True, (118, 205, 128)),
+                (rx + 10, ry + 7))
+            pygame.draw.line(self.screen, (55, 82, 55),
+                             (rx + 10, ry + 22), (rx + rw - 10, ry + 22), 1)
+            best_t = (self._fmt_time(hist["best_time_sec"])
+                      if hist["best_time_sec"] else "--")
+            rows_r = [
+                ("Sessions",    str(hist["total_sessions"]),   (148, 130, 205)),
+                ("Win Rate",    f"{hist['win_rate']}%",
+                 (68, 215, 100) if hist["win_rate"] >= 20 else (215, 68, 68)),
+                ("Best Floor",  str(hist["best_floor"]),       (65, 108, 205)),
+                ("Best Kills",  str(hist["best_kills"]),       (198, 58, 58)),
+                ("Fastest Win", best_t,                        (52, 178, 108)),
+            ]
+            rr_y = ry + 26
+            for rname, rval, rcol in rows_r:
+                self.screen.blit(
+                    self.font_sm.render(rname, True, (130, 118, 172)),
+                    (rx + 14, rr_y + 2))
+                rv2 = self.font_sm.render(rval, True, rcol)
+                self.screen.blit(rv2, (rx + rw - 14 - rv2.get_width(), rr_y + 2))
+                pygame.draw.line(self.screen, (32, 26, 56),
+                                 (rx + 10, rr_y + 16), (rx + rw - 10, rr_y + 16), 1)
+                rr_y += 18
+            return ry + rph2 + 8
+
+        # helper: draw floor distribution bar chart
+        def _draw_floor_dist(ry, height):
+            if height < 50:
+                return
+            self._panel(self.screen, rx, ry, rw, height, border=(68, 56, 95))
+            self.screen.blit(
+                self.font_sm.render("FLOOR DISTRIBUTION", True, (148, 130, 205)),
+                (rx + 10, ry + 7))
+            pygame.draw.line(self.screen, (68, 56, 95),
+                             (rx + 10, ry + 22), (rx + rw - 10, ry + 22), 1)
+            fc_x = rx + 10
+            fc_y = ry + 26
+            fc_w = rw - 20
+            fc_h = height - 36
+            max_fd = max(hist["floor_dist"].values(), default=1) or 1
+            step_w = fc_w / 20.0
+            pygame.draw.rect(self.screen, (14, 10, 30),
+                             (fc_x, fc_y, fc_w, fc_h), border_radius=4)
+            for fl in range(1, 21):
+                cnt2 = hist["floor_dist"].get(fl, 0)
+                bx_f = fc_x + int((fl - 1) * step_w) + 1
+                bw_f = max(2, int(step_w) - 1)
+                bh_f = int(cnt2 / max_fd * (fc_h - 2))
+                if fl == 20:
+                    fc2 = GOLD_COLOR
+                elif fl == 10:
+                    fc2 = (220, 72, 72)
+                elif fl % 5 == 0:
+                    fc2 = (130, 72, 225)
+                else:
+                    frac_c = fl / 20
+                    fc2 = (int(55 + 30 * frac_c), int(95 + 60 * frac_c),
+                           int(195 - 40 * frac_c))
+                if bh_f > 0:
+                    pygame.draw.rect(self.screen, fc2,
+                                     (bx_f, fc_y + fc_h - bh_f, bw_f, bh_f))
+                    pygame.draw.rect(
+                        self.screen,
+                        (min(255, fc2[0]+50), min(255, fc2[1]+50), min(255, fc2[2]+50)),
+                        (bx_f, fc_y + fc_h - bh_f, bw_f, 2))
+                if fl % 5 == 0:
+                    lbl_f = self.font_sm.render(str(fl), True, (90, 80, 115))
+                    self.screen.blit(lbl_f,
+                                     (bx_f + bw_f // 2 - lbl_f.get_width() // 2,
+                                      fc_y + fc_h + 2))
+
+        # ══════════════════════════════════════════════════════════════
+        if self._stats_tab == 0:
+            # ── TAB 0: SESSION ────────────────────────────────────────
+
+            # LEFT A: Kills by enemy bar chart (Graph 1)
+            kph = 28 + 7 * 20
+            self._panel(self.screen, lx, cy_l, lw, kph, border=(68, 52, 112))
+            self.screen.blit(
+                self.font_sm.render("KILLS BY ENEMY TYPE", True, (158, 130, 218)),
+                (lx + 10, cy_l + 7))
+            pygame.draw.line(self.screen, (68, 52, 112),
+                             (lx + 10, cy_l + 22), (lx + lw - 10, cy_l + 22), 1)
+            max_k = max(stats["kills_by_type"].values(), default=1) or 1
+            ky = cy_l + 26
+            for etype, ecol in zip(enemy_order, enemy_cols):
+                cnt   = stats["kills_by_type"].get(etype, 0)
+                fw    = int(bar_bw * cnt / max_k)
+                self.screen.blit(
+                    self.font_sm.render(etype[:9], True, (155, 140, 192)),
+                    (lx + 10, ky + 2))
+                bx2 = lx + 10 + lbl_w
+                pygame.draw.rect(self.screen, (22, 18, 42),
+                                 (bx2, ky, bar_bw, 14), border_radius=3)
+                if fw > 2:
+                    pygame.draw.rect(self.screen, ecol, (bx2, ky, fw, 14), border_radius=3)
+                    tip = pygame.Surface((min(12, fw), 14), pygame.SRCALPHA)
+                    tip.fill((255, 255, 255, 30))
+                    self.screen.blit(tip, (bx2 + fw - min(12, fw), ky))
+                    sh = pygame.Surface((fw, 5), pygame.SRCALPHA)
+                    sh.fill((255, 255, 255, 20))
+                    self.screen.blit(sh, (bx2, ky))
+                pct = int(cnt / total_k * 100) if total_k > 0 else 0
+                cnt_col = (195, 185, 228) if cnt > 0 else (50, 46, 72)
+                vs_cnt = self.font_sm.render(f"{cnt}", True, cnt_col)
+                self.screen.blit(vs_cnt, (bx2 + bar_bw + 4, ky + 1))
+                if cnt > 0 and total_k > 0:
+                    vs_pct = self.font_sm.render(f"{pct}%", True, ecol[:3])
+                    self.screen.blit(vs_pct,
+                                     (bx2 + bar_bw + vs_cnt.get_width() + 7, ky + 1))
+                ky += 20
+            cy_l += kph + 8
+
+            # LEFT B: Session vs Historical comparison
+            cmp_rows = [
+                ("Kills",  stats["total_kills"], hist["avg_kills"],    hist["best_kills"],
+                 (198, 58, 58), True),
+                ("Floor",  stats["floor_reached"], hist["avg_floor"],  hist["best_floor"],
+                 (65, 108, 205), True),
+                ("Combo",  stats["max_combo"], hist["best_combo"] * 0.7, hist["best_combo"],
+                 (198, 150, 26), True),
+                ("Time",   play_sec, hist["avg_time_sec"], None,
+                 (52, 178, 108), False),
+            ]
+            cph = 28 + len(cmp_rows) * 20
+            self._panel(self.screen, lx, cy_l, lw, cph, border=(75, 55, 100))
+            self.screen.blit(
+                self.font_sm.render("SESSION VS HISTORICAL AVERAGE",
+                                    True, (168, 142, 225)),
+                (lx + 10, cy_l + 7))
+            pygame.draw.line(self.screen, (75, 55, 100),
+                             (lx + 10, cy_l + 22), (lx + lw - 10, cy_l + 22), 1)
+            cmp_bar_w = bar_bw - 110
+            cy2 = cy_l + 26
+            for cname, cur_v, avg_v, best_v, ccol, higher_better in cmp_rows:
+                denom   = best_v if (best_v and best_v > 0) else max(avg_v * 1.5, cur_v, 1)
+                fill_w2 = int(cmp_bar_w * min(cur_v, denom) / denom)
+                avg_x   = int(cmp_bar_w * min(avg_v, denom) / denom)
+                self.screen.blit(
+                    self.font_sm.render(f"{cname:<7}", True, (148, 132, 185)),
+                    (lx + 10, cy2 + 2))
+                bx3 = lx + 10 + lbl_w
+                pygame.draw.rect(self.screen, (22, 18, 42),
+                                 (bx3, cy2, cmp_bar_w, 14), border_radius=3)
+                if fill_w2 > 2:
+                    pygame.draw.rect(self.screen, ccol,
+                                     (bx3, cy2, fill_w2, 14), border_radius=3)
+                    sh = pygame.Surface((fill_w2, 5), pygame.SRCALPHA)
+                    sh.fill((255, 255, 255, 18))
+                    self.screen.blit(sh, (bx3, cy2))
+                if avg_x > 0:
+                    pygame.draw.line(self.screen, (255, 255, 100),
+                                     (bx3 + avg_x, cy2 - 1), (bx3 + avg_x, cy2 + 15), 2)
+                above = (cur_v > avg_v) if higher_better else (cur_v < avg_v)
+                arr  = "+" if above else "-"
+                acol = (68, 215, 100) if above else (215, 68, 68)
+                if cname == "Time":
+                    txt = f"{self._fmt_time(cur_v)} ({arr}) {self._fmt_time(avg_v)}"
+                else:
+                    av  = round(avg_v) if avg_v >= 10 else round(avg_v, 1)
+                    txt = f"{int(cur_v)} ({arr}) {av}"
+                self.screen.blit(
+                    self.font_sm.render(txt, True, acol),
+                    (bx3 + cmp_bar_w + 6, cy2 + 1))
+                cy2 += 20
+            cy_l += cph + 8
+
+            # LEFT C: Items collected bar chart
+            item_order = ["potion", "weapon", "armor", "buff", "gold"]
+            item_cols  = [
+                (72, 188, 108), (108, 148, 228), (228, 172, 72),
+                (188, 88, 208), (228, 192, 48),
+            ]
+            iph = 28 + len(item_order) * 20
+            avail_l = (py + ph - 18) - cy_l
+            if avail_l >= iph:
+                self._panel(self.screen, lx, cy_l, lw, iph, border=(55, 80, 68))
+                self.screen.blit(
+                    self.font_sm.render("ITEMS COLLECTED", True, (118, 205, 148)),
+                    (lx + 10, cy_l + 7))
+                pygame.draw.line(self.screen, (55, 80, 68),
+                                 (lx + 10, cy_l + 22), (lx + lw - 10, cy_l + 22), 1)
+                max_i = max(
+                    (stats["items_by_type"].get(it, 0) for it in item_order), default=1
+                ) or 1
+                iy = cy_l + 26
+                for iname, icol in zip(item_order, item_cols):
+                    cnt_i  = stats["items_by_type"].get(iname, 0)
+                    fw_i   = int(bar_bw * cnt_i / max_i)
+                    self.screen.blit(
+                        self.font_sm.render(iname[:9].capitalize(), True, (138, 175, 155)),
+                        (lx + 10, iy + 2))
+                    bxi = lx + 10 + lbl_w
+                    pygame.draw.rect(self.screen, (22, 18, 42),
+                                     (bxi, iy, bar_bw, 14), border_radius=3)
+                    if fw_i > 2:
+                        pygame.draw.rect(self.screen, icol,
+                                         (bxi, iy, fw_i, 14), border_radius=3)
+                        shi = pygame.Surface((fw_i, 5), pygame.SRCALPHA)
+                        shi.fill((255, 255, 255, 20))
+                        self.screen.blit(shi, (bxi, iy))
+                    self.screen.blit(
+                        self.font_sm.render(str(cnt_i), True,
+                                            (185, 215, 195) if cnt_i > 0 else (48, 44, 65)),
+                        (bxi + bar_bw + 4, iy + 1))
+                    iy += 20
+                cy_l += iph + 8
+
+            # RIGHT A: HP over time line chart (Graph 2)
+            hph = 156
+            self._panel(self.screen, rx, cy_r, rw, hph, border=(80, 40, 60))
+            self.screen.blit(
+                self.font_sm.render("HP OVER TIME", True, (215, 115, 125)),
+                (rx + 10, cy_r + 7))
+            pygame.draw.line(self.screen, (80, 40, 60),
+                             (rx + 10, cy_r + 22), (rx + rw - 10, cy_r + 22), 1)
+            chart_x = rx + 10
+            chart_y = cy_r + 26
+            chart_w = rw - 20
+            chart_h = hph - 36
+            pygame.draw.rect(self.screen, (14, 10, 30),
+                             (chart_x, chart_y, chart_w, chart_h), border_radius=4)
+            pygame.draw.rect(self.screen, (44, 32, 70),
+                             (chart_x, chart_y, chart_w, chart_h), 1, border_radius=4)
+            for frac_g in (0.25, 0.5, 0.75, 1.0):
+                gy = chart_y + chart_h - 2 - int(frac_g * (chart_h - 4))
+                pygame.draw.line(self.screen, (35, 28, 58),
+                                 (chart_x + 1, gy), (chart_x + chart_w - 1, gy), 1)
+            if len(hp_data) >= 2:
+                t0v     = hp_data[0][0]
+                trange  = max(hp_data[-1][0] - t0v, 1)
+                max_hpv = max(h[2] for h in hp_data) or 1
+                pts = [
+                    (chart_x + 2 + int((ts3 - t0v) / trange * (chart_w - 4)),
+                     chart_y + chart_h - 2 - int(hp3 / max_hpv * (chart_h - 4)))
+                    for ts3, hp3, _ in hp_data
+                ]
+                for pass_a in (35, 22, 12):
+                    fs = pygame.Surface((chart_w, chart_h), pygame.SRCALPHA)
+                    local = [(p[0]-chart_x, p[1]-chart_y + pass_a//10) for p in pts]
+                    poly  = [(local[0][0], chart_h-1)] + local + [(local[-1][0], chart_h-1)]
+                    if len(poly) >= 3:
+                        pygame.draw.polygon(fs, (220, 52, 52, pass_a), poly)
+                    self.screen.blit(fs, (chart_x, chart_y))
+                pygame.draw.lines(self.screen, (180, 45, 45), False, pts, 3)
+                pygame.draw.lines(self.screen, (245, 82, 82), False, pts, 1)
+                for pt in pts[::max(1, len(pts) // 10)]:
+                    pygame.draw.circle(self.screen, (255, 110, 110), pt, 3)
+                    pygame.draw.circle(self.screen, WHITE, pt, 1)
+                pygame.draw.line(self.screen, (48, 188, 68),
+                                 (chart_x+2, chart_y+2), (chart_x+chart_w-2, chart_y+2), 1)
+                ts_lbl = self.font_sm.render("0:00", True, (65, 55, 82))
+                te_lbl = self.font_sm.render(self._fmt_time(play_sec), True, (65, 55, 82))
+                self.screen.blit(ts_lbl, (chart_x+2, chart_y+chart_h+2))
+                self.screen.blit(te_lbl, (chart_x+chart_w-te_lbl.get_width()-2,
+                                          chart_y+chart_h+2))
+            elif len(hp_data) == 1:
+                ts3, hp3, mhp3 = hp_data[0]
+                fy = chart_y + chart_h - 2 - int(hp3 / max(mhp3, 1) * (chart_h - 4))
+                pygame.draw.circle(self.screen, (245, 82, 82),
+                                   (chart_x + chart_w // 2, fy), 5)
+            else:
+                nd = self.font_sm.render("No HP data yet", True, (65, 55, 82))
+                self.screen.blit(nd, (chart_x + chart_w//2 - nd.get_width()//2,
+                                      chart_y + chart_h//2 - nd.get_height()//2))
+            cy_r += hph + 8
+
+            # RIGHT B: All-time records
+            cy_r = _draw_records_panel(cy_r)
+
+            # RIGHT C: Floor distribution (fills remaining right space)
+            avail_r = (py + ph - 18) - cy_r
+            if avail_r >= 50:
+                _draw_floor_dist(cy_r, avail_r)
+
+        else:
+            # ── TAB 1: ALL SESSIONS ───────────────────────────────────
+
+            # LEFT: Past sessions table
+            all_sess = self.leaderboard.entries
+            row_h    = 18
+            tph      = py + ph - 18 - cy_l
+            max_rows = max(0, (tph - 40) // row_h)
+            self._panel(self.screen, lx, cy_l, lw, tph, border=(58, 52, 100))
+            self.screen.blit(
+                self.font_sm.render("PAST SESSIONS", True, (168, 148, 228)),
+                (lx + 10, cy_l + 7))
+            tavg = self.font_sm.render(
+                f"avg: Floor {hist['avg_floor']}  "
+                f"{hist['avg_kills']}K  {self._fmt_time(hist['avg_time_sec'])}",
+                True, (100, 115, 160))
+            self.screen.blit(tavg, (lx + lw - tavg.get_width() - 10, cy_l + 7))
+            pygame.draw.line(self.screen, (58, 52, 100),
+                             (lx + 10, cy_l + 22), (lx + lw - 10, cy_l + 22), 1)
+
+            tcols = [
+                ("#",      52), ("NAME", 140), ("FLOOR", 52),
+                ("KILLS",  50), ("COMBO", 52), ("TIME",  0),
+            ]
+            col_xs: list[int] = []
+            cx_acc = lx + 10
+            for _cn, _cw in tcols:
+                col_xs.append(cx_acc)
+                cx_acc += _cw if _cw else (lw - (cx_acc - lx) - 10)
+
+            ch_y = cy_l + 26
+            for i_c, (_cn, _) in enumerate(tcols):
+                hs = self.font_sm.render(_cn, True, (108, 95, 148))
+                self.screen.blit(hs, (col_xs[i_c], ch_y))
+            pygame.draw.line(self.screen, (48, 42, 82),
+                             (lx + 10, ch_y + 14), (lx + lw - 10, ch_y + 14), 1)
+
+            scroll_off = max(0, min(self._table_scroll,
+                                     max(0, len(all_sess) - max_rows)))
+            tr_y  = ch_y + 16
+            shown = 0
+            for e in all_sess[scroll_off:]:
+                if shown >= max_rows:
+                    break
+                abs_idx = shown + scroll_off
+                is_cur  = (e.get("session_id", "") == sid)
+                is_sel  = (abs_idx == self._selected_hist_idx)
+                if is_sel:
+                    hl = pygame.Surface((lw - 22, row_h - 1), pygame.SRCALPHA)
+                    hl.fill((145, 108, 240, 55))
+                    self.screen.blit(hl, (lx + 10, tr_y))
+                elif is_cur:
+                    hl = pygame.Surface((lw - 22, row_h - 1), pygame.SRCALPHA)
+                    hl.fill((255, 220, 80, 30))
+                    self.screen.blit(hl, (lx + 10, tr_y))
+                elif shown % 2 == 0:
+                    st = pygame.Surface((lw - 22, row_h - 1), pygame.SRCALPHA)
+                    st.fill((255, 255, 255, 5))
+                    self.screen.blit(st, (lx + 10, tr_y))
+                bc  = (255, 220, 80) if is_cur else (165, 152, 200)
+                d   = float(e.get("duration_sec", 0))
+                row_vals = [
+                    (f"#{e.get('rank','?')}", bc),
+                    (str(e.get("player_name", "?"))[:13], bc),
+                    (str(e.get("floor_reached","?")),
+                     (140, 200, 255) if is_cur else (100, 160, 255)),
+                    (str(e.get("kills","?")),
+                     (255, 140, 140) if is_cur else (220, 100, 100)),
+                    (f"x{e.get('max_combo','?')}",
+                     (255, 220, 80) if is_cur else (220, 185, 60)),
+                    (self._fmt_time(d),
+                     (120, 240, 160) if is_cur else (90, 200, 140)),
+                ]
+                for i_c, (val_str, vcol) in enumerate(row_vals):
+                    vs = self.font_sm.render(val_str, True, vcol)
+                    self.screen.blit(vs, (col_xs[i_c], tr_y + 2))
+                pygame.draw.line(self.screen, (32, 28, 58),
+                                 (lx + 10, tr_y + row_h - 1),
+                                 (lx + lw - 10, tr_y + row_h - 1), 1)
+                tr_y  += row_h
+                shown += 1
+            if not all_sess:
+                nd = self.font_sm.render("No sessions yet — play to populate.",
+                                         True, (65, 58, 92))
+                self.screen.blit(nd, (lx + lw//2 - nd.get_width()//2,
+                                      cy_l + tph // 2))
+            # Scrollbar
+            if len(all_sess) > max_rows:
+                sb_x    = lx + lw - 8
+                sb_area = tph - 42
+                sb_y0   = cy_l + 40
+                thumb_h = max(16, sb_area * max_rows // len(all_sess))
+                thumb_y = (sb_y0 + int((sb_area - thumb_h) * scroll_off
+                            / max(1, len(all_sess) - max_rows)))
+                pygame.draw.rect(self.screen, (30, 24, 55),
+                                 (sb_x, sb_y0, 5, sb_area), border_radius=3)
+                pygame.draw.rect(self.screen, (110, 90, 175),
+                                 (sb_x, thumb_y, 5, thumb_h), border_radius=3)
+
+            # RIGHT: All-time records + comparison (if row selected) or floor dist
+            cy_r = _draw_records_panel(cy_r)
+            sel_idx = self._selected_hist_idx
+            all_e   = self.leaderboard.entries
+            if sel_idx is not None and 0 <= sel_idx < len(all_e):
+                e_sel     = all_e[sel_idx]
+                sel_floor = int(e_sel.get("floor_reached", 0))
+                sel_kills = int(e_sel.get("kills", 0))
+                sel_combo = int(e_sel.get("max_combo", 0))
+                sel_time  = float(e_sel.get("duration_sec", 0))
+                sel_name  = str(e_sel.get("player_name", "?"))[:11]
+                sel_rank  = e_sel.get("rank", "?")
+                cmp_lbl_w = 52
+                cmp_bar_w_s = rw - cmp_lbl_w - 24 - 96   # ~182px bar, ~96px text
+                cph_s = 28 + 4 * 20   # 108
+                avail_s = py + ph - 18 - cy_r
+                cph_s = min(cph_s, avail_s)
+                self._panel(self.screen, rx, cy_r, rw, cph_s, border=(75, 55, 110))
+                hdr = self.font_sm.render(f"#{sel_rank} {sel_name} VS AVG",
+                                          True, (175, 148, 235))
+                self.screen.blit(hdr, (rx + 10, cy_r + 7))
+                pygame.draw.line(self.screen, (75, 55, 110),
+                                 (rx + 10, cy_r + 22), (rx + rw - 10, cy_r + 22), 1)
+                cmp_rows_s = [
+                    ("Floor", sel_floor, hist["avg_floor"],
+                     hist["best_floor"], (65, 108, 205), True),
+                    ("Kills", sel_kills, hist["avg_kills"],
+                     hist["best_kills"], (198, 58, 58), True),
+                    ("Combo", sel_combo, hist["best_combo"] * 0.7,
+                     hist["best_combo"], (198, 150, 26), True),
+                    ("Time",  sel_time,  hist["avg_time_sec"],
+                     None, (52, 178, 108), False),
+                ]
+                cy_s = cy_r + 26
+                for cname_s, cur_vs, avg_vs, best_vs, ccol_s, hb_s in cmp_rows_s:
+                    denom_s = (best_vs if (best_vs and best_vs > 0)
+                               else max(avg_vs * 1.5, cur_vs, 1))
+                    fill_ws = int(cmp_bar_w_s * min(cur_vs, denom_s) / denom_s)
+                    avg_xs  = int(cmp_bar_w_s * min(avg_vs, denom_s) / denom_s)
+                    self.screen.blit(
+                        self.font_sm.render(cname_s, True, (148, 132, 185)),
+                        (rx + 10, cy_s + 2))
+                    bxs = rx + 10 + cmp_lbl_w
+                    pygame.draw.rect(self.screen, (22, 18, 42),
+                                     (bxs, cy_s, cmp_bar_w_s, 14), border_radius=3)
+                    if fill_ws > 2:
+                        pygame.draw.rect(self.screen, ccol_s,
+                                         (bxs, cy_s, fill_ws, 14), border_radius=3)
+                        sh_s = pygame.Surface((fill_ws, 5), pygame.SRCALPHA)
+                        sh_s.fill((255, 255, 255, 18))
+                        self.screen.blit(sh_s, (bxs, cy_s))
+                    if avg_xs > 0:
+                        pygame.draw.line(self.screen, (255, 255, 100),
+                                         (bxs + avg_xs, cy_s - 1),
+                                         (bxs + avg_xs, cy_s + 15), 2)
+                    above_s = (cur_vs > avg_vs) if hb_s else (cur_vs < avg_vs)
+                    arr_s   = "+" if above_s else "-"
+                    acol_s  = (68, 215, 100) if above_s else (215, 68, 68)
+                    if cname_s == "Time":
+                        txt_s = (f"{self._fmt_time(cur_vs)} ({arr_s}) "
+                                 f"{self._fmt_time(avg_vs)}")
+                    else:
+                        av_s  = round(avg_vs) if avg_vs >= 10 else round(avg_vs, 1)
+                        txt_s = f"{int(cur_vs)} ({arr_s}) {av_s}"
+                    self.screen.blit(
+                        self.font_sm.render(txt_s, True, acol_s),
+                        (bxs + cmp_bar_w_s + 6, cy_s + 1))
+                    cy_s += 20
+                cy_r += cph_s + 8
+                avail_fd2 = py + ph - 18 - cy_r
+                if avail_fd2 >= 50:
+                    _draw_floor_dist(cy_r, avail_fd2)
+            else:
+                _draw_floor_dist(cy_r, py + ph - 18 - cy_r)
+
+        # ══ BOTTOM RANK STRIP (both tabs) ════════════════════════════
+        strip_y = py + ph - 18
+        strip_bg = pygame.Surface((pw - 8, 16), pygame.SRCALPHA)
+        strip_bg.fill((14, 10, 34, 220))
+        self.screen.blit(strip_bg, (px + 4, strip_y))
+        pygame.draw.line(self.screen, (65, 50, 110),
+                         (px + 10, strip_y), (px + pw - 10, strip_y), 1)
+        if self._stats_tab == 1:
+            cmp_hint = ("click row to compare" if self._selected_hist_idx is None
+                        else f"comparing #{self._selected_hist_idx + 1} — click again to clear")
+            rank_txt = (f"RANK #{p_rank} / {p_total}   |   "
+                        f"{hist['total_sessions']} total runs   |   "
+                        f"{cmp_hint}   |   [TAB] switch   [ESC] close")
+        elif p_rank > 0:
+            rank_txt = (f"RANK #{p_rank} / {p_total}   |   "
+                        f"Best combo x{hist['best_combo']}   |   "
+                        f"{sum(hist['floor_dist'].values())} total runs   |   "
+                        f"[TAB] switch   [ESC] close")
+        else:
+            rank_txt = (f"Sessions: {hist['total_sessions']}   |   "
+                        f"Win rate: {hist['win_rate']}%   |   "
+                        f"[TAB] switch tab   [ESC] close")
+        rs = self.font_sm.render(rank_txt, True, (115, 100, 162))
+        self.screen.blit(rs, (cx - rs.get_width()//2, strip_y + 2))
 
     # ------------------------------------------------------------------
     # ICON / ANIMATION HELPERS

@@ -509,6 +509,10 @@ class Boss(Enemy):
         self.special_cd        = 0
         self.special_rate      = 3000  # ms
 
+        self._summon_cd        = 0
+        self._summon_rate      = 9000  # ms between summon waves
+        self.pending_spawns:   list    = []
+
         self.attack_rate = 600   # faster
 
     # ------------------------------------------------------------------
@@ -547,12 +551,45 @@ class Boss(Enemy):
         return 0
 
     # ------------------------------------------------------------------
+    def try_summon(self, walls_set, grid_w: int, grid_h: int,
+                   current_time_ms: int):
+        """Spawn a wave of minions around the boss. Fully guarded against errors."""
+        try:
+            if current_time_ms - self._summon_cd < self._summon_rate:
+                return
+            if not walls_set or grid_w <= 0 or grid_h <= 0:
+                return
+            self._summon_cd = current_time_ms
+            count = 3 if self.phase == 2 else 2
+            spawned = 0
+            for _ in range(count):
+                for _attempt in range(30):
+                    ox = int(self.x) + random.randint(-3, 3) * TILE_SIZE
+                    oy = int(self.y) + random.randint(-3, 3) * TILE_SIZE
+                    tx = ox // TILE_SIZE
+                    ty = oy // TILE_SIZE
+                    if (tx, ty) not in walls_set and 0 < tx < grid_w - 1 and 0 < ty < grid_h - 1:
+                        try:
+                            minion = Enemy(ox, oy, self.floor_num, player_atk=max(1, self.attack // 2))
+                            minion.aggro = True
+                            self.pending_spawns.append(minion)
+                            spawned += 1
+                        except Exception:
+                            pass
+                        break
+            if spawned > 0:
+                self._vfx.append(("summon_burst", self.x, self.y, current_time_ms))
+        except Exception:
+            pass   # summon failure is non-fatal
+
+    # ------------------------------------------------------------------
     def choose_action(self, player, walls_set, grid_w, grid_h,
                       curse_type: str, current_time_ms: int):
         # Phase check
         if self.phase == 1 and self.hp < self.max_hp * 0.5:
             self.phase_transition()
         self.special_attack(player, current_time_ms)
+        self.try_summon(walls_set, grid_w, grid_h, current_time_ms)
         super().choose_action(player, walls_set, grid_w, grid_h,
                               curse_type, current_time_ms)
 
@@ -574,7 +611,7 @@ class Boss(Enemy):
         now_v = pygame.time.get_ticks()
         alive_vfx = []
         for vtype, vx, vy, vt in self._vfx:
-            dur = 650 if "slam" in vtype else 320
+            dur = 800 if "summon" in vtype else 650 if "slam" in vtype else 320
             elapsed = now_v - vt
             if elapsed >= dur:
                 continue
@@ -607,6 +644,34 @@ class Boss(Enemy):
                         sa = int(255 * (1 - prog / 0.38))
                         sps = pygame.Surface((10, 10), pygame.SRCALPHA)
                         pygame.draw.circle(sps, (*spark_col, sa), (5, 5), 3)
+                        surface.blit(sps, (sx2 - 5, sy2 - 5))
+
+            elif vtype == "summon_burst":
+                # Purple portal ring expanding outward
+                ring_col  = (180, 60, 255)
+                inner_col = (220, 140, 255)
+                for ri in range(3):
+                    rp = max(0.0, prog - ri * 0.15)
+                    if rp <= 0:
+                        continue
+                    rad = int(10 + 120 * rp)
+                    alpha = int(200 * (1 - rp))
+                    rs = pygame.Surface((rad * 2 + 14, rad * 2 + 14), pygame.SRCALPHA)
+                    pygame.draw.circle(rs, (*ring_col, alpha),
+                                       (rad + 7, rad + 7), rad, max(1, 4 - ri))
+                    pygame.draw.circle(rs, (*inner_col, alpha // 2),
+                                       (rad + 7, rad + 7), max(1, rad - 5), 2)
+                    surface.blit(rs, (int(vx) - rad - 7, int(vy) - rad - 7))
+                # Rune sparks
+                if prog < 0.5:
+                    for si in range(8):
+                        ang_s = si * math.pi * 2 / 8 + prog * 4
+                        dist_s = int(15 + 80 * prog)
+                        sx2 = int(vx + math.cos(ang_s) * dist_s)
+                        sy2 = int(vy + math.sin(ang_s) * dist_s)
+                        sa = int(240 * (1 - prog / 0.5))
+                        sps = pygame.Surface((10, 10), pygame.SRCALPHA)
+                        pygame.draw.circle(sps, (200, 100, 255, sa), (5, 5), 3)
                         surface.blit(sps, (sx2 - 5, sy2 - 5))
 
         self._vfx = alive_vfx

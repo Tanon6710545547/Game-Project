@@ -5,8 +5,9 @@ All sheets are horizontal strips; each frame is FRAME_W × FRAME_H pixels.
 from __future__ import annotations
 import os
 import pygame
+from src.constants import ASSETS_DIR
 
-ANIM_DIR   = os.path.join(os.path.dirname(__file__), "Animetion")
+ANIM_DIR   = os.path.join(ASSETS_DIR, "Animetion")
 FRAME_W    = 100
 FRAME_H    = 100
 

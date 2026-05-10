@@ -41,11 +41,14 @@ class Merchant:
     COLS     = 3
     PADDING  = 28
 
+    RESTOCK_LIMIT = 3
+
     def __init__(self, floor_num: int, stat_tracker=None):
         self.floor_num    = floor_num
         self.stat_tracker = stat_tracker
         self.inventory: list[dict] = []
         self.sold:       list[bool] = []
+        self.restock_count = 0
         self.restock()
         self.done = False
 
@@ -101,13 +104,29 @@ class Merchant:
         return f"Bought {item.name}! {msg}"
 
     # ------------------------------------------------------------------
+    RESTOCK_COST = 50
+
+    def try_restock(self, player) -> str:
+        if self.restock_count >= self.RESTOCK_LIMIT:
+            return f"Restock limit reached ({self.RESTOCK_LIMIT}x per shop)."
+        if player.gold < self.RESTOCK_COST:
+            return f"Not enough gold! (Need {self.RESTOCK_COST})"
+        player.gold -= self.RESTOCK_COST
+        self.restock()
+        self.restock_count += 1
+        remaining = self.RESTOCK_LIMIT - self.restock_count
+        return f"Shop restocked! ({remaining} use{'s' if remaining != 1 else ''} left)"
+
     def handle_event(self, event: pygame.event.Event, player) -> str | None:
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mx, my = event.pos
-            leave_rect = pygame.Rect(SCREEN_WIDTH // 2 - 88, SCREEN_HEIGHT - 76, 176, 48)
+            leave_rect   = pygame.Rect(SCREEN_WIDTH // 2 - 88, SCREEN_HEIGHT - 76,  176, 48)
+            restock_rect = pygame.Rect(SCREEN_WIDTH // 2 - 120, SCREEN_HEIGHT - 138, 240, 54)
             if leave_rect.collidepoint(mx, my):
                 self.done = True
                 return "leave"
+            if restock_rect.collidepoint(mx, my):
+                return self.try_restock(player)
             start_x = (SCREEN_WIDTH - (self.SLOT_W * self.COLS + self.PADDING * (self.COLS - 1))) // 2
             start_y = 186
             for i, entry in enumerate(self.inventory):
@@ -465,6 +484,50 @@ class Merchant:
                     ss2  = pygame.Surface((5, 5), pygame.SRCALPHA)
                     pygame.draw.circle(ss2, (255, 225, 70, al), (2, 2), 2)
                     surface.blit(ss2, (sp_x - 2, sp_y - 2))
+
+        # ── Restock button (wider 2-line layout, no icon overlap) ──────────
+        RBW, RBH   = 240, 54
+        restock_rect = pygame.Rect(cx - RBW // 2, SCREEN_HEIGHT - 138, RBW, RBH)
+        rhov        = restock_rect.collidepoint(*pygame.mouse.get_pos())
+        uses_left   = max(0, self.RESTOCK_LIMIT - self.restock_count)
+        exhausted   = (uses_left == 0)
+        can_restock = (player.gold >= self.RESTOCK_COST) and not exhausted
+
+        # Hover glow
+        if rhov and can_restock:
+            for gd in range(8, 0, -2):
+                gls3 = pygame.Surface((RBW + gd * 2, RBH + gd * 2), pygame.SRCALPHA)
+                ga3  = int(38 * (gd / 8))
+                pygame.draw.rect(gls3, (40, 160, 80, ga3),
+                                 (0, 0, RBW + gd * 2, RBH + gd * 2), border_radius=12 + gd)
+                surface.blit(gls3, (restock_rect.x - gd, restock_rect.y - gd))
+
+        rb_bg = (38, 88, 52) if (rhov and can_restock) else \
+                (24, 56, 34) if can_restock else (38, 28, 30)
+        pygame.draw.rect(surface, rb_bg, restock_rect, border_radius=10)
+        # Top-shine strip
+        rshine = pygame.Surface((RBW, RBH // 2), pygame.SRCALPHA)
+        rshine.fill((255, 255, 255, 14 if rhov and can_restock else 7))
+        surface.blit(rshine, (restock_rect.x, restock_rect.y))
+        rb_border = (80, 210, 100) if (rhov and can_restock) else \
+                    (42, 130, 64) if can_restock else (70, 48, 55)
+        pygame.draw.rect(surface, rb_border, restock_rect, 2, border_radius=10)
+
+        # Line 1: main label — centred in upper half of button
+        rc_main  = WHITE if can_restock else (130, 95, 95)
+        line1    = font_med.render(f"Restock  {self.RESTOCK_COST} G", True, rc_main)
+        surface.blit(line1, (restock_rect.centerx - line1.get_width() // 2,
+                             restock_rect.y + 8))
+        # Line 2: uses remaining — centred in lower half
+        if exhausted:
+            cnt_col   = (170, 60, 60)
+            cnt_label = "No uses remaining"
+        else:
+            cnt_col   = (100, 190, 120)
+            cnt_label = f"({uses_left} of {self.RESTOCK_LIMIT} uses left)"
+        line2 = font_sm.render(cnt_label, True, cnt_col)
+        surface.blit(line2, (restock_rect.centerx - line2.get_width() // 2,
+                             restock_rect.y + RBH - font_sm.get_height() - 7))
 
         # ── Leave button ───────────────────────────────────────────────────
         leave_rect = pygame.Rect(cx - 88, SCREEN_HEIGHT - 76, 176, 48)

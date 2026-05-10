@@ -8,7 +8,7 @@ import pygame
 from src.constants import (
     SCREEN_WIDTH, SCREEN_HEIGHT, TILE_SIZE, COLS, ROWS,
     WHITE, RED, GREEN, YELLOW, ORANGE, PURPLE, GOLD_COLOR, DARK_GRAY, GRAY,
-    COMBO_MAX,
+    COMBO_MAX, ASSETS_DIR,
     FIREBALL_STAMINA_COST, AREA_STAMINA_COST, ATTACK_STAMINA_COST,
 )
 
@@ -36,7 +36,7 @@ def _load_stamina_icon():
     global _STAMINA_ICON
     if _STAMINA_ICON is not None:
         return
-    path = os.path.join(os.path.dirname(__file__), "stamina.png")
+    path = os.path.join(ASSETS_DIR, "stamina.png")
     try:
         img = pygame.image.load(path).convert_alpha()
         _STAMINA_ICON = pygame.transform.smoothscale(img, (13, 13))
@@ -117,7 +117,8 @@ class HUD:
         _load_stamina_icon()
 
     # ------------------------------------------------------------------
-    def draw(self, surface: pygame.Surface, player, floor, combo_system):
+    def draw(self, surface: pygame.Surface, player, floor, combo_system,
+             play_time_ms: float = 0):
         now = pygame.time.get_ticks()
         t   = now / 1000.0
 
@@ -255,15 +256,21 @@ class HUD:
         kl_s = self.font_sm.render(f" Kills: {player.kills}", True, (140, 130, 160))
         surface.blit(kl_s, (rx + 15, HUD_Y + 30))
 
-        # Boss / merchant label
-        if floor.is_boss:
-            boss_s = self.font_xs.render("BOSS FLOOR", True, (255, 80, 60))
-            surface.blit(boss_s, (rx, HUD_Y + 48))
-        elif floor.is_merchant:
-            merch_s = self.font_xs.render("MERCHANT", True, GOLD_COLOR)
-            surface.blit(merch_s, (rx, HUD_Y + 48))
+        # Live play timer
+        ps = int(play_time_ms / 1000)
+        time_str = f"{ps // 60}:{ps % 60:02d}"
+        tm_s = self.font_sm.render(f"TIME {time_str}", True, (90, 175, 130))
+        surface.blit(tm_s, (rx, HUD_Y + 48))
 
-        # Curse indicator — below floor info
+        # Boss / merchant label — rendered small to right of timer
+        if floor.is_boss:
+            boss_s = self.font_xs.render("BOSS", True, (255, 80, 60))
+            surface.blit(boss_s, (rx + tm_s.get_width() + 8, HUD_Y + 50))
+        elif floor.is_merchant:
+            merch_s = self.font_xs.render("SHOP", True, GOLD_COLOR)
+            surface.blit(merch_s, (rx + tm_s.get_width() + 8, HUD_Y + 50))
+
+        # Curse indicator
         if floor.curse_type != "none":
             cl = floor.curse_type.replace("_", " ").title()
             pulse_o = int(200 + 40 * math.sin(t * 2.8))
